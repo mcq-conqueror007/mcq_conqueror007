@@ -4685,7 +4685,14 @@ create policy "Admin-only write MCQs" on questions for all
       return false;
     }
 
-    function openAdminModal() {
+    function openAdminModal(skipAutoBio = false) {
+      const forcePasscodeModal = (skipAutoBio === true);
+      if (!state.isAdmin && !forcePasscodeModal && getSavedBioCredId() && isBiometricSupported()) {
+        verifyAdminFingerprint().then((ok) => {
+          if (!ok) openAdminModal(true);
+        });
+        return;
+      }
       if (state.isAdmin) {
         const html = `
           <div class="space-y-4">
@@ -4766,19 +4773,6 @@ create policy "Admin-only write MCQs" on questions for all
         <div class="space-y-4">
           <p class="text-sm text-slate-600">Only the site creator (<strong>MD. RAID</strong>) can add subjects or upload MCQs. Anyone can practice MCQs without logging in.</p>
 
-          ${getSavedBioCredId() ? `
-            <div class="p-4 rounded-xl border border-emerald-200 bg-emerald-50/70 flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <div class="text-xs font-bold text-emerald-900 uppercase tracking-wide">Quick Biometric Unlock</div>
-                <div class="text-[11px] text-emerald-700 mt-0.5">Use your device fingerprint sensor / Windows Hello / Touch ID</div>
-              </div>
-              <button type="button" id="btnUnlockAdminBio" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs sm:text-sm font-bold shadow-xs flex items-center gap-1.5">
-                <span>👆</span>
-                <span>Unlock with Fingerprint</span>
-              </button>
-            </div>
-          ` : ''}
-
           <!-- Local Passcode Unlock -->
           <form id="localAdminLoginForm" class="p-4 rounded-xl border border-slate-200 bg-slate-50 space-y-3">
             <div class="flex flex-wrap items-center justify-between gap-1">
@@ -4827,9 +4821,6 @@ create policy "Admin-only write MCQs" on questions for all
           }
         });
 
-        document.getElementById('btnUnlockAdminBio')?.addEventListener('click', () => {
-          verifyAdminFingerprint();
-        });
         document.getElementById('localAdminLoginForm').addEventListener('submit', (e) => {
           e.preventDefault();
           const val = document.getElementById('adminPasscodeInput').value.trim();
