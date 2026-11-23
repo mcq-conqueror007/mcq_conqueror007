@@ -6422,6 +6422,7 @@ create policy "Admin-only write MCQs" on questions for all
     // =========================================================================
     // ADMIN AI-POWERED PDF & VIDEO TO MCQ GENERATOR (STRICTLY ADMIN-ONLY)
     // =========================================================================
+    let aiGenAbortCtrl = null;
     let aiGenState = {
       sourceTab: 'pdf', // 'pdf' | 'video'
       sourceName: '',
@@ -6429,7 +6430,12 @@ create policy "Admin-only write MCQs" on questions for all
       extractedPages: 0,
       needsOcr: false,
       lastPdfFile: null,
+      pdfFiles: [], // [{ id, name, pages, text, base64, useDirectAi, sizeMb }]
+      pdfBase64: '', // Direct Gemini Vision PDF payload (for scanned or complex PDFs <= 18MB)
+      useDirectPdfAi: false,
       videoUrl: '',
+      videoStartMin: 0,
+      videoEndMin: 20, // Fast 20-min default window (~6-12s per batch)
       videoStatus: '',
       extracting: false,
       extractProgress: '',
@@ -6443,7 +6449,7 @@ create policy "Admin-only write MCQs" on questions for all
       count: 10,
       difficulty: 'Moderate',
       format: 'Mixed',
-      drafts: [], // [{ tempId, question, options, correctIndex, explanation, subjectId, chapter, difficulty, format, sourceRef, approved, isDuplicate, dupMatch }]
+      drafts: [],
       errorMsg: ''
     };
 
@@ -6463,6 +6469,16 @@ create policy "Admin-only write MCQs" on questions for all
         s.onerror = () => reject(new Error('Could not load library: ' + src));
         document.head.appendChild(s);
       });
+    }
+
+    function arrayBufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      return btoa(binary);
     }
 
     function normalizeForDupCheck(text) {
@@ -6519,26 +6535,78 @@ create policy "Admin-only write MCQs" on questions for all
       return drafts;
     }
 
+    function parseRobustJsonArray(rawText) {
+      const cleaned = String(rawText || '').replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+      const first = cleaned.indexOf('[');
+      const last = cleaned.lastIndexOf(']');
+      if (first !== -1 && last !== -1 && last > first) {
+        try {
+          const parsed = JSON.parse(cleaned.slice(first, last + 1));
+          if (Array.isArray(parsed)) return parsed;
+        } catch (_) {}
+      }
+      // Fallback: recover all complete JSON objects {...} even if response truncated near the end
+      const recovered = [];
+      const objMatches = cleaned.match(/\{[^{}]*"question"[\s\S]*?"options"[\s\S]*?\}/g) || [];
+      for (const m of objMatches) {
+        try {
+          const obj = JSON.parse(m);
+          if (obj && obj.question && Array.isArray(obj.options)) recovered.push(obj);
+        } catch (_) {}
+      }
+      if (recovered.length) return recovered;
+      throw new Error('AI returned an unexpected format. Please try again with a smaller batch (10 or 20 Qs).');
+    }
+
     async function extractPdfFileWithPdfJs(file, runOcr = false) {
       if (!file) return;
       aiGenState.extracting = true;
       aiGenState.errorMsg = '';
       aiGenState.needsOcr = false;
+      aiGenState.useDirectPdfAi = false;
+      aiGenState.pdfBase64 = '';
       aiGenState.lastPdfFile = file;
       aiGenState.sourceName = file.name;
-      aiGenState.extractProgress = 'Loading PDF.js engine...';
+      aiGenState.extractProgress = 'Reading PDF file...';
       render();
 
       try {
-        await loadExternalScriptOnce(
-          'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
-          () => typeof window.pdfjsLib !== 'undefined'
-        );
-        window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-          'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-
         const buf = await file.arrayBuffer();
-        const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+        const sizeMb = buf.byteLength / (1024 * 1024);
+
+        // Prepare direct Gemini PDF Vision payload for files <= 18 MB (works even on scanned PDFs & zero CORS worker issues!)
+        if (sizeMb <= 18) {
+          aiGenState.pdfBase64 = arrayBufferToBase64(buf);
+        }
+
+        // Try fast PDF.js text extraction (with automatic workerless fallback if CDN worker is blocked)
+        let pdf = null;
+        try {
+          aiGenState.extractProgress = 'Loading PDF.js text extractor...';
+          const progEl = document.getElementById('aiGenExtractProg');
+          if (progEl) progEl.textContent = aiGenState.extractProgress;
+
+          await loadExternalScriptOnce(
+            'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+            () => typeof window.pdfjsLib !== 'undefined'
+          );
+          try {
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+              'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+            pdf = await window.pdfjsLib.getDocument({ data: buf.slice(0) }).promise;
+          } catch (_) {
+            // Worker blocked by browser/CORS -> seamlessly run workerless!
+            pdf = await window.pdfjsLib.getDocument({ data: buf.slice(0), disableWorker: true }).promise;
+          }
+        } catch (pdfErr) {
+          if (aiGenState.pdfBase64) {
+            aiGenState.useDirectPdfAi = true;
+            aiGenState.extractProgress = `✓ PDF loaded (${sizeMb.toFixed(1)} MB) — ready for Direct Gemini Vision PDF reading (works on both text & scanned PDFs)!`;
+            return;
+          }
+          throw pdfErr;
+        }
+
         aiGenState.extractedPages = pdf.numPages;
 
         if (!runOcr) {
@@ -6554,11 +6622,18 @@ create policy "Admin-only write MCQs" on questions for all
           }
           const combined = allText.join('\n\n');
           aiGenState.extractedText = combined;
+
           if (combined.length < Math.max(120, pdf.numPages * 35)) {
-            aiGenState.needsOcr = true;
-            aiGenState.extractProgress = `Low text detected (${combined.length} chars across ${pdf.numPages} pages). This looks like a scanned PDF — click "Run OCR" below.`;
+            if (aiGenState.pdfBase64) {
+              aiGenState.useDirectPdfAi = true;
+              aiGenState.needsOcr = true;
+              aiGenState.extractProgress = `Scanned PDF detected (${pdf.numPages} pages, ${sizeMb.toFixed(1)} MB) — Direct Gemini Vision PDF mode enabled automatically (no slow OCR needed)!`;
+            } else {
+              aiGenState.needsOcr = true;
+              aiGenState.extractProgress = `Scanned PDF > 18 MB (${pdf.numPages} pages). Click "Run OCR" below to extract text locally.`;
+            }
           } else {
-            aiGenState.extractProgress = `Extracted ${combined.length.toLocaleString()} characters from ${pdf.numPages} page(s).`;
+            aiGenState.extractProgress = `✓ Extracted ${combined.length.toLocaleString()} characters from ${pdf.numPages} page(s).`;
           }
         } else {
           aiGenState.extractProgress = 'Loading Tesseract.js OCR engine...';
@@ -6570,11 +6645,11 @@ create policy "Admin-only write MCQs" on questions for all
           const maxOcrPages = Math.min(pdf.numPages, 15);
           let ocrParts = [];
           for (let p = 1; p <= maxOcrPages; p++) {
-            aiGenState.extractProgress = `Running OCR on page ${p} of ${maxOcrPages}...`;
+            aiGenState.extractProgress = `Running local OCR on page ${p} of ${maxOcrPages}...`;
             const progEl = document.getElementById('aiGenExtractProg');
             if (progEl) progEl.textContent = aiGenState.extractProgress;
             const page = await pdf.getPage(p);
-            const vp = page.getViewport({ scale: 1.6 });
+            const vp = page.getViewport({ scale: 1.5 });
             const canvas = document.createElement('canvas');
             canvas.width = vp.width;
             canvas.height = vp.height;
@@ -6586,7 +6661,7 @@ create policy "Admin-only write MCQs" on questions for all
           }
           aiGenState.extractedText = ocrParts.join('\n\n');
           aiGenState.needsOcr = false;
-          aiGenState.extractProgress = `OCR complete: extracted ${aiGenState.extractedText.length.toLocaleString()} characters from ${maxOcrPages} page(s).`;
+          aiGenState.extractProgress = `✓ OCR complete: extracted ${aiGenState.extractedText.length.toLocaleString()} characters from ${maxOcrPages} page(s).`;
         }
       } catch (err) {
         aiGenState.errorMsg = `PDF extraction failed: ${err.message}`;
@@ -6596,8 +6671,75 @@ create policy "Admin-only write MCQs" on questions for all
       }
     }
 
+    async function extractMultiplePdfFiles(fileList) {
+      const files = Array.from(fileList || []).filter(f => f && f.name.toLowerCase().endsWith('.pdf'));
+      if (!files.length) { showToast('Please select one or more .pdf files.', 'error'); return; }
+      if (files.length === 1 && !aiGenState.pdfFiles.length) {
+        await extractPdfFileWithPdfJs(files[0], false);
+        aiGenState.pdfFiles = [{
+          id: 'pdf-' + Date.now(),
+          name: files[0].name,
+          pages: aiGenState.extractedPages || 0,
+          text: aiGenState.extractedText || '',
+          base64: aiGenState.pdfBase64 || '',
+          useDirectAi: aiGenState.useDirectPdfAi,
+          sizeMb: Number((files[0].size / (1024 * 1024)).toFixed(1))
+        }];
+        render();
+        return;
+      }
+
+      // Multiple PDFs uploaded -> automatically switch to ALL_COMBINED if user hasn't explicitly restricted
+      aiGenState.extracting = true;
+      aiGenState.errorMsg = '';
+      if (files.length > 1) aiGenState.subjectId = 'ALL_COMBINED';
+      render();
+
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        aiGenState.extractProgress = `Processing PDF ${i + 1}/${files.length}: ${f.name}...`;
+        render();
+        await extractPdfFileWithPdfJs(f, false);
+        aiGenState.pdfFiles.push({
+          id: `pdf-${Date.now()}-${i}`,
+          name: f.name,
+          pages: aiGenState.extractedPages || 0,
+          text: aiGenState.extractedText || '',
+          base64: aiGenState.pdfBase64 || '',
+          useDirectAi: aiGenState.useDirectPdfAi,
+          sizeMb: Number((f.size / (1024 * 1024)).toFixed(1))
+        });
+      }
+
+      // Rebuild combined source text & source name across all queued PDFs
+      syncCombinedPdfState();
+      aiGenState.extracting = false;
+      render();
+    }
+
+    function syncCombinedPdfState() {
+      const list = aiGenState.pdfFiles || [];
+      if (!list.length) {
+        aiGenState.extractedText = '';
+        aiGenState.sourceName = '';
+        aiGenState.pdfBase64 = '';
+        aiGenState.useDirectPdfAi = false;
+        aiGenState.extractProgress = '';
+        return;
+      }
+      aiGenState.sourceName = list.length === 1 ? list[0].name : `${list.length} Combined PDFs (${list.map(x => x.name).join(', ').slice(0, 60)})`;
+      aiGenState.extractedText = list
+        .filter(x => x.text && x.text.trim())
+        .map(x => `=== FILE: ${x.name} ===\n${x.text}`)
+        .join('\n\n');
+      const visionFile = list.find(x => x.useDirectAi && x.base64);
+      aiGenState.useDirectPdfAi = Boolean(visionFile && aiGenState.extractedText.length < 150);
+      aiGenState.pdfBase64 = visionFile ? visionFile.base64 : '';
+      aiGenState.extractProgress = `✓ Ready: ${list.length} PDF${list.length === 1 ? '' : 's'} queued (${aiGenState.extractedText.length.toLocaleString()} chars extracted).`;
+    }
+
     function parseYouTubeVideoId(url) {
-      const m = String(url || '').match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+      const m = String(url || '').match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/|live\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
       return m ? m[1] : null;
     }
 
@@ -6607,17 +6749,16 @@ create policy "Admin-only write MCQs" on questions for all
       aiGenState.errorMsg = '';
       if (!vid) {
         aiGenState.videoStatus = '';
-        aiGenState.errorMsg = 'Please enter a valid YouTube URL (e.g., https://www.youtube.com/watch?v=...).';
+        aiGenState.errorMsg = 'Please enter a valid YouTube URL (e.g., https://www.youtube.com/watch?v=... or https://youtu.be/...).';
         render();
         return;
       }
       aiGenState.extracting = true;
       aiGenState.sourceName = `YouTube Video (${vid})`;
-      aiGenState.videoStatus = 'Checking video metadata & accessible captions...';
+      aiGenState.videoStatus = 'Verifying YouTube link...';
       render();
 
       try {
-        // Fetch public video title via YouTube oEmbed (CORS-friendly, no downloading)
         let title = `YouTube Video (${vid})`;
         try {
           const om = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${vid}&format=json`);
@@ -6627,8 +6768,7 @@ create policy "Admin-only write MCQs" on questions for all
           }
         } catch (_) {}
         aiGenState.sourceName = `YouTube: ${title}`;
-
-        aiGenState.videoStatus = `✓ Ready: "${title}" — Gemini will process this YouTube video directly without needing a pasted transcript!`;
+        aiGenState.videoStatus = `✓ Ready: "${title}" — Direct Gemini Video mode active (fast time-segmented processing).`;
       } catch (err) {
         aiGenState.errorMsg = `Video lookup error: ${err.message}`;
       } finally {
@@ -6637,26 +6777,40 @@ create policy "Admin-only write MCQs" on questions for all
       }
     }
 
-    async function callAiForMcqJson(promptText, youtubeUrl = null) {
+    async function callAiForMcqJson(promptText, mediaOpts = {}) {
       if (!hasLiveAiConfigured()) {
-        throw new Error('No AI API key configured yet. Open MAHA GYANI ⚙️ Settings to connect your free Google Gemini API key.');
+        throw new Error('No AI API key configured yet. Click ⚙️ AI Settings to connect your free Google Gemini API key.');
       }
       const { provider, model, apiKey, endpoint } = mgState.config;
-      if (youtubeUrl && provider !== 'gemini') {
-        throw new Error('Direct YouTube link processing requires Google Gemini (Free Key). Switch AI Provider to Google Gemini in ⚙️ AI Settings.');
+      const { youtubeUrl, startSec, endSec, pdfBase64 } = mediaOpts || {};
+      if ((youtubeUrl || pdfBase64) && provider !== 'gemini') {
+        throw new Error('Direct YouTube video & Vision PDF processing require Google Gemini (Free Key). Switch AI Provider to Google Gemini in ⚙️ AI Settings.');
       }
-      const sysPrompt = 'You are an expert CMA/CA/B.Com examination item writer. Return ONLY valid raw JSON (an array of MCQ objects) with no markdown fences and no extra commentary.';
+      const sysPrompt = 'You are an expert CMA/CA/B.Com examination item writer. Output ONLY a valid JSON array of MCQ objects matching the requested schema.';
 
       let rawReply = '';
       if (provider === 'gemini') {
         const useModel = (model || 'gemini-3.5-flash-lite').trim();
-        const userParts = youtubeUrl
-          ? [{ fileData: { fileUri: youtubeUrl }, videoMetadata: { fps: 0.1 } }, { text: promptText }]
-          : [{ text: promptText }];
+        let userParts;
+        if (youtubeUrl) {
+          const vMeta = { fps: 0.1 };
+          if (typeof startSec === 'number' && startSec >= 0) vMeta.startOffset = `${Math.floor(startSec)}s`;
+          if (typeof endSec === 'number' && endSec > (startSec || 0)) vMeta.endOffset = `${Math.floor(endSec)}s`;
+          userParts = [{ fileData: { fileUri: youtubeUrl }, videoMetadata: vMeta }, { text: promptText }];
+        } else if (pdfBase64) {
+          userParts = [{ inlineData: { mimeType: 'application/pdf', data: pdfBase64 } }, { text: promptText }];
+        } else {
+          userParts = [{ text: promptText }];
+        }
         rawReply = await fetchGeminiWithAutoFallback(useModel, apiKey, {
           systemInstruction: { parts: [{ text: sysPrompt }] },
           contents: [{ role: 'user', parts: userParts }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 8192 }
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 4096,
+            responseMimeType: 'application/json',
+            thinkingConfig: { thinkingLevel: 'minimal' }
+          }
         });
       } else {
         const url = (endpoint && endpoint.trim()) || (MG_DEFAULTS[provider]?.endpoint || 'https://api.openai.com/v1/chat/completions');
@@ -6672,7 +6826,7 @@ create policy "Admin-only write MCQs" on questions for all
               { role: 'system', content: sysPrompt },
               { role: 'user', content: promptText }
             ],
-            temperature: 0.3,
+            temperature: 0.25,
             max_tokens: 4096
           })
         });
@@ -6681,14 +6835,7 @@ create policy "Admin-only write MCQs" on questions for all
         rawReply = data?.choices?.[0]?.message?.content || '';
       }
 
-      // Extract JSON array cleanly
-      const cleaned = rawReply.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
-      const firstBracket = cleaned.indexOf('[');
-      const lastBracket = cleaned.lastIndexOf(']');
-      if (firstBracket === -1 || lastBracket === -1) {
-        throw new Error('AI response did not contain a valid JSON array. Please try again.');
-      }
-      return JSON.parse(cleaned.slice(firstBracket, lastBracket + 1));
+      return parseRobustJsonArray(rawReply);
     }
 
     async function generateMcqsFromSource() {
@@ -6696,6 +6843,7 @@ create policy "Admin-only write MCQs" on questions for all
       const vid = isVideoMode ? parseYouTubeVideoId(aiGenState.videoUrl) : null;
       const directYtUrl = vid ? `https://www.youtube.com/watch?v=${vid}` : null;
       const srcText = (aiGenState.extractedText || '').trim();
+      const useDirectPdf = !isVideoMode && aiGenState.useDirectPdfAi && Boolean(aiGenState.pdfBase64);
 
       if (isVideoMode) {
         if (!directYtUrl) {
@@ -6704,27 +6852,35 @@ create policy "Admin-only write MCQs" on questions for all
           return;
         }
         if (!aiGenState.sourceName) aiGenState.sourceName = `YouTube Video (${vid})`;
-      } else if (srcText.length < 80) {
+      } else if (!useDirectPdf && srcText.length < 80) {
         aiGenState.errorMsg = 'Please upload a PDF document first.';
         render();
         return;
       }
-      const subj = state.subjects.find(s => s.id === aiGenState.subjectId) || state.subjects[0];
+
+      const isAllCombined = aiGenState.subjectId === 'ALL_COMBINED';
+      const subj = isAllCombined ? state.subjects[0] : (state.subjects.find(s => s.id === aiGenState.subjectId) || state.subjects[0]);
       const allSubjChapters = Array.from(new Set(subj.questions.map(q => q.chapter)));
-      const mode = aiGenState.chapterMode || 'auto';
-      const allowedChapters = mode === 'auto'
-        ? allSubjChapters
-        : mode === 'multi'
-          ? (aiGenState.selectedChapters.length ? aiGenState.selectedChapters : allSubjChapters)
-          : [(aiGenState.customChapter || '').trim() || aiGenState.chapter || allSubjChapters[0] || 'General Chapter'];
-      const isMultiChapter = mode === 'auto' || (mode === 'multi' && allowedChapters.length > 1);
+      const mode = isAllCombined ? 'auto' : (aiGenState.chapterMode || 'auto');
+      const allowedChapters = isAllCombined
+        ? state.subjects.flatMap(s => Array.from(new Set(s.questions.map(q => q.chapter))))
+        : mode === 'auto'
+          ? allSubjChapters
+          : mode === 'multi'
+            ? (aiGenState.selectedChapters.length ? aiGenState.selectedChapters : allSubjChapters)
+            : [(aiGenState.customChapter || '').trim() || aiGenState.chapter || allSubjChapters[0] || 'General Chapter'];
+      const isMultiChapter = isAllCombined || mode === 'auto' || (mode === 'multi' && allowedChapters.length > 1);
+      const allSubjectsCatalog = isAllCombined
+        ? state.subjects.map(s => `Subject ID "${s.id}" (${s.name}): [${Array.from(new Set(s.questions.map(q => q.chapter))).map(c => `"${c}"`).join(', ')}]`).join('\n')
+        : '';
       const totalWanted = Number(aiGenState.count) || 10;
-      const batchSize = totalWanted > 20 ? 20 : totalWanted;
+      const batchSize = totalWanted > 15 ? 15 : totalWanted;
       const batches = Math.ceil(totalWanted / batchSize);
 
       aiGenState.generating = true;
       aiGenState.errorMsg = '';
       aiGenState.drafts = [];
+      aiGenAbortCtrl = new AbortController();
       const genStartedAt = Date.now();
       const genTick = setInterval(() => {
         const el = document.getElementById('aiGenElapsedSec');
@@ -6733,17 +6889,26 @@ create policy "Admin-only write MCQs" on questions for all
       render();
 
       try {
-        // Slice across the full marathon transcript/PDF so all chapters in long lectures get covered evenly
-        const chunkWindow = 22000;
+        const chunkWindow = 12000;
+        const baseStartMin = Math.max(0, Number(aiGenState.videoStartMin) || 0);
+        const baseEndMin = Math.max(baseStartMin + 5, Number(aiGenState.videoEndMin) || (baseStartMin + 20));
 
         for (let b = 0; b < batches; b++) {
+          if (aiGenAbortCtrl && aiGenAbortCtrl.signal.aborted) break;
           const need = Math.min(batchSize, totalWanted - aiGenState.drafts.length);
-          aiGenState.genProgress = `Generating batch ${b + 1} of ${batches} (${need} MCQs)...`;
+          const segStartMin = directYtUrl ? baseStartMin + Math.floor(((baseEndMin - baseStartMin) / batches) * b) : 0;
+          const segEndMin = directYtUrl ? baseStartMin + Math.ceil(((baseEndMin - baseStartMin) / batches) * (b + 1)) : 0;
+
+          aiGenState.genProgress = directYtUrl
+            ? `Batch ${b + 1}/${batches} (${segStartMin}m–${segEndMin}m, ${need} MCQs)...`
+            : useDirectPdf
+              ? `Reading PDF with Gemini Vision — batch ${b + 1}/${batches} (${need} MCQs)...`
+              : `Generating batch ${b + 1}/${batches} (${need} MCQs)...`;
           const el = document.getElementById('aiGenStatusMsg');
           if (el) el.textContent = aiGenState.genProgress;
 
           let startPos = 0;
-          if (srcText.length > chunkWindow && batches > 1) {
+          if (!directYtUrl && !useDirectPdf && srcText.length > chunkWindow && batches > 1) {
             const maxStart = srcText.length - chunkWindow;
             startPos = Math.round((b / (batches - 1)) * maxStart);
           }
@@ -6754,11 +6919,12 @@ create policy "Admin-only write MCQs" on questions for all
             ? `- Multi-Chapter Mode: Assign EACH question to the single most accurate chapter name verbatim from this list:\n  ${allowedChapters.map(c => `"${c}"`).join(', ')}`
             : `- Chapter: ${allowedChapters[0]}`;
 
-          const prompt = `Generate exactly ${need} high-quality, non-ambiguous Multiple Choice Questions strictly supported by the SOURCE MATERIAL below.
+          const prompt = `Generate exactly ${need} high-quality, non-ambiguous Multiple Choice Questions in clean English strictly supported by the source material.
 
 PARAMETERS:
-- Subject: ${subj.name}
-${chapterInstruction}
+${isAllCombined
+  ? `- ALL SUBJECTS COMBINED ROUTER MODE: Automatically classify EACH question into its exact matching "subjectId" and "chapter" from this official catalog:\n${allSubjectsCatalog}`
+  : `- Subject: ${subj.name}\n${chapterInstruction}`}
 - Difficulty: ${aiGenState.difficulty}
 - Format: ${aiGenState.format}
 ${avoidList ? `- Do NOT repeat these already-generated questions: ${avoidList}` : ''}
@@ -6767,36 +6933,44 @@ STRICT QUALITY RULES:
 1. Every question MUST be directly supported by the source material. Never invent facts.
 2. Provide exactly 4 distinct options (no option prefixes like "a)" or "(A)").
 3. Ensure "correctIndex" (integer 0, 1, 2, or 3) strictly matches the "explanation".
-4. Include a clear, concise 1-3 sentence "explanation".
-5. Include "chapter" matching the exact chapter name from the allowed list.
+4. Include a clear, concise 1-2 sentence "explanation".
+5. Include "chapter" matching an exact chapter name from the allowed list.
 
-Return ONLY a JSON array of objects in this exact schema:
-[
-  {
-    "chapter": "${allowedChapters[0]}",
-    "question": "...",
-    "options": ["opt0", "opt1", "opt2", "opt3"],
-    "correctIndex": 0,
-    "explanation": "..."
-  }
-]
+Return ONLY a JSON array of objects:
+[{"subjectId":"${subj.id}","chapter":"${allowedChapters[0]}","question":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."}]
 
 ${directYtUrl
-  ? `SOURCE VIDEO (${aiGenState.sourceName || directYtUrl}): Watch and analyze the attached YouTube lecture video directly (focus on segment/batch ${b + 1} of ${batches} so the full lecture is covered without duplicates).`
-  : `SOURCE MATERIAL (${aiGenState.sourceName || 'Uploaded Study Material'}, Part ${b + 1}/${batches}):\n${contextChunk}`}`;
+  ? `SOURCE VIDEO (${aiGenState.sourceName || directYtUrl}): Extract and draft ${need} MCQs from this ${segStartMin}–${segEndMin} minute lecture segment.`
+  : useDirectPdf
+    ? `SOURCE PDF (${aiGenState.sourceName}): Read the attached PDF directly and draft ${need} MCQs (batch ${b + 1} of ${batches}).`
+    : `SOURCE MATERIAL (${aiGenState.sourceName || 'Uploaded PDF'}, Part ${b + 1}/${batches}):\n${contextChunk}`}`;
 
-          const parsed = await callAiForMcqJson(prompt, directYtUrl);
+          const mediaOpts = directYtUrl
+            ? { youtubeUrl: directYtUrl, startSec: segStartMin * 60, endSec: segEndMin * 60 }
+            : useDirectPdf
+              ? { pdfBase64: aiGenState.pdfBase64 }
+              : {};
+
+          const parsed = await callAiForMcqJson(prompt, mediaOpts);
           if (!Array.isArray(parsed)) continue;
 
           parsed.forEach((item, idx) => {
             if (!item || !item.question || !Array.isArray(item.options) || item.options.length !== 4) return;
             const ci = Number(item.correctIndex);
             if (isNaN(ci) || ci < 0 || ci > 3) return;
-            let assignedChap = allowedChapters[0];
+            let assignedSubj = subj;
+            if (isAllCombined && item.subjectId) {
+              const sidRaw = String(item.subjectId).trim().toLowerCase();
+              assignedSubj = state.subjects.find(s => s.id.toLowerCase() === sidRaw || s.code.toLowerCase() === sidRaw || s.name.toLowerCase().includes(sidRaw)) || subj;
+            }
+            const subjChaps = Array.from(new Set(assignedSubj.questions.map(q => q.chapter)));
+            const chapPool = isAllCombined ? subjChaps : allowedChapters;
+            let assignedChap = chapPool[0] || 'General Chapter';
             if (isMultiChapter && item.chapter) {
-              const exact = allowedChapters.find(c => c.toLowerCase() === String(item.chapter).trim().toLowerCase());
-              const partial = exact || allowedChapters.find(c => c.toLowerCase().includes(String(item.chapter).trim().toLowerCase()) || String(item.chapter).trim().toLowerCase().includes(c.toLowerCase().split(':')[0]));
-              assignedChap = partial || allowedChapters[0];
+              const chRaw = String(item.chapter).trim().toLowerCase();
+              const exact = chapPool.find(c => c.toLowerCase() === chRaw);
+              const partial = exact || chapPool.find(c => c.toLowerCase().includes(chRaw) || chRaw.includes(c.toLowerCase().split(':')[0]));
+              assignedChap = partial || chapPool[0] || 'General Chapter';
             }
             aiGenState.drafts.push({
               tempId: `draft-${Date.now()}-${b}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
@@ -6804,7 +6978,7 @@ ${directYtUrl
               options: item.options.map(o => String(o).trim()),
               correctIndex: ci,
               explanation: String(item.explanation || '').trim(),
-              subjectId: subj.id,
+              subjectId: assignedSubj.id,
               chapter: assignedChap,
               difficulty: aiGenState.difficulty,
               format: aiGenState.format,
@@ -6816,11 +6990,20 @@ ${directYtUrl
           });
         }
         detectDuplicatesInDrafts(aiGenState.drafts);
-        showToast(`Generated ${aiGenState.drafts.length} MCQs for review!`, 'success');
+        if (aiGenState.drafts.length) {
+          showToast(`Generated ${aiGenState.drafts.length} MCQs for review!`, 'success');
+        } else if (!aiGenAbortCtrl?.signal.aborted) {
+          aiGenState.errorMsg = 'No valid MCQs were returned for this segment. Try another minute range or a different PDF.';
+        }
       } catch (err) {
-        aiGenState.errorMsg = err.message;
+        if (err && err.name === 'AbortError') {
+          showToast('Generation cancelled.', 'info');
+        } else {
+          aiGenState.errorMsg = err.message;
+        }
       } finally {
         clearInterval(genTick);
+        aiGenAbortCtrl = null;
         aiGenState.generating = false;
         aiGenState.genProgress = '';
         render();
@@ -6834,16 +7017,18 @@ ${directYtUrl
       const subj = state.subjects.find(s => s.id === d.subjectId) || state.subjects[0];
       showToast('Regenerating question...', 'info');
       try {
-        const prompt = `Generate exactly 1 fresh, completely different MCQ from the SOURCE MATERIAL below to replace this question: "${d.question}".
+        const vid = aiGenState.sourceTab === 'video' ? parseYouTubeVideoId(aiGenState.videoUrl) : null;
+        const useDirectPdf = aiGenState.sourceTab === 'pdf' && aiGenState.useDirectPdfAi && Boolean(aiGenState.pdfBase64);
+        const prompt = `Generate exactly 1 fresh, completely different MCQ from the source material to replace: "${d.question}".
 Subject: ${subj.name}, Chapter: ${d.chapter}, Difficulty: ${d.difficulty}, Format: ${d.format}.
-Return ONLY a JSON array with 1 object: [{"question":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."}].
-${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
-  ? 'SOURCE VIDEO: Use the attached YouTube video directly.'
-  : 'SOURCE MATERIAL:\n' + (aiGenState.extractedText || '').slice(0, 16000)}`;
-        const regenYt = aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
-          ? `https://www.youtube.com/watch?v=${parseYouTubeVideoId(aiGenState.videoUrl)}`
-          : null;
-        const arr = await callAiForMcqJson(prompt, regenYt);
+Return ONLY a JSON array with 1 object: [{"chapter":"${d.chapter}","question":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."}].
+${vid ? 'SOURCE VIDEO: Use the attached YouTube video segment.' : useDirectPdf ? 'SOURCE PDF: Use the attached PDF.' : 'SOURCE MATERIAL:\n' + (aiGenState.extractedText || '').slice(0, 16000)}`;
+        const mediaOpts = vid
+          ? { youtubeUrl: `https://www.youtube.com/watch?v=${vid}`, startSec: (Number(aiGenState.videoStartMin) || 0) * 60, endSec: (Number(aiGenState.videoEndMin) || 20) * 60 }
+          : useDirectPdf
+            ? { pdfBase64: aiGenState.pdfBase64 }
+            : {};
+        const arr = await callAiForMcqJson(prompt, mediaOpts);
         if (Array.isArray(arr) && arr[0] && Array.isArray(arr[0].options) && arr[0].options.length === 4) {
           const item = arr[0];
           aiGenState.drafts[idx] = {
@@ -6907,7 +7092,13 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
       aiGenState.drafts = aiGenState.drafts.filter(d => !d.approved);
       saveState();
       render();
-      showToast(`Published ${publishedCount} approved MCQs into the question bank!`, 'success');
+      const distCounts = {};
+      approved.forEach(d => {
+        const sc = (state.subjects.find(s => s.id === d.subjectId) || {}).code || d.subjectId;
+        distCounts[sc] = (distCounts[sc] || 0) + 1;
+      });
+      const distStr = Object.entries(distCounts).map(([k, v]) => `${k}: ${v}`).join(', ');
+      showToast(`Published ${publishedCount} MCQs (${distStr})!`, 'success');
     }
 
     function downloadApprovedDraftsJson() {
@@ -6948,7 +7139,8 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
         `;
       }
 
-      const subj = state.subjects.find(s => s.id === aiGenState.subjectId) || state.subjects[0];
+      const isAllCombined = aiGenState.subjectId === 'ALL_COMBINED';
+      const subj = isAllCombined ? state.subjects[0] : (state.subjects.find(s => s.id === aiGenState.subjectId) || state.subjects[0]);
       const chapters = Array.from(new Set(subj.questions.map(q => q.chapter)));
       if (!aiGenState.chapter && chapters.length) aiGenState.chapter = chapters[0];
       const approvedCount = aiGenState.drafts.filter(d => d.approved).length;
@@ -7000,10 +7192,20 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
                   <div class="w-10 h-10 rounded-xl bg-indigo-100 text-indigo-600 flex items-center justify-center mx-auto">
                     <i data-lucide="file-up" class="w-5 h-5"></i>
                   </div>
-                  <div class="text-sm font-bold text-slate-800">Drag & drop a PDF here, or click to browse</div>
-                  <p class="text-xs text-slate-500">Multi-page PDFs supported via PDF.js • Scanned PDFs supported via optional Tesseract OCR</p>
-                  <input id="aiGenPdfInput" type="file" accept=".pdf,application/pdf" class="hidden" />
+                  <div class="text-sm font-bold text-slate-800">Drag & drop 1 or multiple PDFs here, or click to browse</div>
+                  <p class="text-xs text-slate-500">Upload multiple subjects' PDFs at once • Text & Scanned PDFs supported automatically</p>
+                  <input id="aiGenPdfInput" type="file" accept=".pdf,application/pdf" multiple class="hidden" />
                 </div>
+                ${(aiGenState.pdfFiles || []).length ? `
+                  <div class="flex flex-wrap gap-1.5">
+                    ${aiGenState.pdfFiles.map(f => `
+                      <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-50 border border-indigo-200 text-[11px] font-semibold text-indigo-800">
+                        <span>📄 ${escapeHtml(f.name)} (${f.pages || '?'}p)</span>
+                        <button type="button" data-rm-pdf="${f.id}" class="text-rose-600 hover:text-rose-800 font-bold">✕</button>
+                      </span>
+                    `).join('')}
+                  </div>
+                ` : ''}
                 ${aiGenState.extractProgress ? `
                   <div class="p-3 rounded-xl bg-slate-50 border border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs">
                     <span id="aiGenExtractProg" class="font-semibold text-slate-700">${escapeHtml(aiGenState.extractProgress)}</span>
@@ -7030,9 +7232,26 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
                   <textarea id="aiGenSourceTextarea" rows="6" placeholder="Uploaded PDF text will appear here automatically..." class="w-full rounded-xl border border-slate-300 p-3 text-xs leading-relaxed">${escapeHtml(aiGenState.extractedText)}</textarea>
                 </div>
               ` : `
-                <div class="p-3.5 rounded-xl bg-emerald-50/70 border border-emerald-200 text-xs text-emerald-900 space-y-1">
-                  <div class="font-bold flex items-center gap-1.5">✓ Direct YouTube-to-MCQ Mode (No Transcript Needed)</div>
-                  <p class="text-[11px] text-emerald-800">Just paste any public YouTube lecture link above and click <strong>Generate MCQs with AI</strong>. Google Gemini analyzes the video directly (free tier supports up to 8 hours of public YouTube video/day).</p>
+                <div class="p-3.5 rounded-xl bg-emerald-50/70 border border-emerald-200 text-xs text-emerald-900 space-y-2.5">
+                  <div class="font-bold flex items-center gap-1.5">✓ Direct YouTube-to-MCQ Mode (Fast Time-Segmented Analysis)</div>
+                  <p class="text-[11px] text-emerald-800">For 4+ hour marathon lectures, process 30–60 minute segments at a time so Gemini responds in ~15 seconds and never hits token limits:</p>
+                  <div class="grid grid-cols-2 gap-2 pt-0.5">
+                    <div>
+                      <label class="block text-[11px] font-bold text-emerald-900 mb-1">Start Minute</label>
+                      <input id="aiGenVidStartMin" type="number" min="0" max="600" value="${Number(aiGenState.videoStartMin) || 0}" class="w-full rounded-lg border border-emerald-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-900" />
+                    </div>
+                    <div>
+                      <label class="block text-[11px] font-bold text-emerald-900 mb-1">End Minute</label>
+                      <input id="aiGenVidEndMin" type="number" min="5" max="600" value="${Number(aiGenState.videoEndMin) || 20}" class="w-full rounded-lg border border-emerald-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-900" />
+                    </div>
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <button type="button" data-yt-seg="0,20" class="px-2 py-1 rounded-lg bg-white border border-emerald-300 text-[11px] font-bold text-emerald-800 hover:bg-emerald-100">0–20m (Fast)</button>
+                    <button type="button" data-yt-seg="20,40" class="px-2 py-1 rounded-lg bg-white border border-emerald-300 text-[11px] font-bold text-emerald-800 hover:bg-emerald-100">20–40m</button>
+                    <button type="button" data-yt-seg="40,60" class="px-2 py-1 rounded-lg bg-white border border-emerald-300 text-[11px] font-bold text-emerald-800 hover:bg-emerald-100">40–60m</button>
+                    <button type="button" data-yt-seg="60,90" class="px-2 py-1 rounded-lg bg-white border border-emerald-300 text-[11px] font-bold text-emerald-800 hover:bg-emerald-100">60–90m</button>
+                    <button type="button" data-yt-seg="90,120" class="px-2 py-1 rounded-lg bg-white border border-emerald-300 text-[11px] font-bold text-emerald-800 hover:bg-emerald-100">90–120m</button>
+                  </div>
                 </div>
               `}
             </div>
@@ -7043,10 +7262,17 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
               <div class="space-y-3 text-xs sm:text-sm">
                 <div>
                   <label class="block text-xs font-semibold text-slate-600 mb-1">Subject</label>
-                  <select id="aiGenSubjSel" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs sm:text-sm">
-                    ${state.subjects.map(s => `<option value="${escapeHtml(s.id)}" ${s.id === subj.id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
+                  <select id="aiGenSubjSel" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs sm:text-sm font-semibold">
+                    <option value="ALL_COMBINED" ${isAllCombined ? 'selected' : ''}>✨ All Subjects Combined (Auto-Distribute to Subject & Chapter)</option>
+                    ${state.subjects.map(s => `<option value="${escapeHtml(s.id)}" ${!isAllCombined && s.id === subj.id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
                   </select>
                 </div>
+                ${isAllCombined ? `
+                  <div class="p-3.5 rounded-xl bg-gradient-to-r from-indigo-50 to-violet-50 border border-indigo-200 text-xs text-indigo-900 space-y-1.5">
+                    <div class="font-bold flex items-center gap-1.5">✨ All-Subjects Combined Auto-Router Active</div>
+                    <p class="text-[11px] text-indigo-800">Upload multiple PDFs from different subjects (or a mixed marathon lecture). Every generated MCQ will be automatically routed to its exact <strong>Subject</strong> (${state.subjects.map(s => escapeHtml(s.code)).join(', ')}) and <strong>Chapter</strong>—and you can fine-tune any question's Subject/Chapter in the Review Panel before publishing!</p>
+                  </div>
+                ` : `
                 <div>
                   <label class="block text-xs font-semibold text-slate-600 mb-1.5">Chapter Mapping Mode</label>
                   <div class="grid grid-cols-3 gap-1.5 bg-slate-100 p-1 rounded-xl">
@@ -7091,6 +7317,7 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
                     <input id="aiGenCustomChap" type="text" value="${escapeHtml(aiGenState.customChapter)}" placeholder="Leave blank to use selected chapter above" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs sm:text-sm" />
                   </div>
                 `}
+                `}
                 <div class="grid grid-cols-3 gap-2">
                   <div>
                     <label class="block text-xs font-semibold text-slate-600 mb-1">Questions</label>
@@ -7121,7 +7348,7 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
                       <span class="w-3.5 h-3.5 rounded-full border-2 border-indigo-600 border-t-transparent animate-spin inline-block"></span>
                       <span id="aiGenStatusMsg">${escapeHtml(aiGenState.genProgress || 'Analyzing lecture & generating MCQs...')}</span>
                     </span>
-                    <span id="aiGenElapsedSec" class="font-mono text-indigo-600 font-bold">0s</span>
+                    <div class="flex items-center gap-2"><span id="aiGenElapsedSec" class="font-mono text-indigo-600 font-bold">0s</span><button type="button" id="btnAiGenCancel" class="px-2 py-0.5 rounded bg-rose-100 text-rose-700 hover:bg-rose-200 text-[11px] font-bold">Stop</button></div>
                   </div>
                 ` : ''}
               </div>
@@ -7152,9 +7379,16 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
                           <span>Q${idx + 1} Approved</span>
                         </label>
                         <span class="px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 text-[11px] font-bold">${escapeHtml(d.difficulty)} • ${escapeHtml(d.format)}</span>
+                        <select data-draft-subj="${d.tempId}" class="rounded-lg border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[11px] font-bold text-indigo-800" title="Assigned Subject">
+                          ${state.subjects.map(s => `<option value="${escapeHtml(s.id)}" ${s.id === d.subjectId ? 'selected' : ''}>${escapeHtml(s.code)}</option>`).join('')}
+                        </select>
                         <select data-draft-chap="${d.tempId}" class="rounded-lg border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-semibold text-slate-700 max-w-[230px]" title="Assigned Chapter">
-                          ${chapters.map(c => `<option value="${escapeHtml(c)}" ${c === d.chapter ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
-                          ${!chapters.includes(d.chapter) ? `<option value="${escapeHtml(d.chapter)}" selected>${escapeHtml(d.chapter)}</option>` : ''}
+                          ${(() => {
+                            const ds = state.subjects.find(s => s.id === d.subjectId) || state.subjects[0];
+                            const dChaps = Array.from(new Set(ds.questions.map(q => q.chapter)));
+                            return dChaps.map(c => `<option value="${escapeHtml(c)}" ${c === d.chapter ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')
+                              + (!dChaps.includes(d.chapter) ? `<option value="${escapeHtml(d.chapter)}" selected>${escapeHtml(d.chapter)}</option>` : '');
+                          })()}
                         </select>
                         ${d.isDuplicate ? `<span class="px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-[11px] font-bold" title="${escapeHtml(d.dupMatch)}">⚠ Possible Duplicate</span>` : ''}
                       </div>
@@ -7221,13 +7455,10 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
         dropZone.addEventListener('drop', (e) => {
           e.preventDefault();
           dropZone.classList.remove('border-indigo-500', 'bg-indigo-50');
-          const f = e.dataTransfer?.files?.[0];
-          if (f && f.name.toLowerCase().endsWith('.pdf')) extractPdfFileWithPdfJs(f, false);
-          else showToast('Please drop a valid .pdf file.', 'error');
+          if (e.dataTransfer?.files?.length) extractMultiplePdfFiles(e.dataTransfer.files);
         });
         fileInp.addEventListener('change', () => {
-          const f = fileInp.files?.[0];
-          if (f) extractPdfFileWithPdfJs(f, false);
+          if (fileInp.files?.length) extractMultiplePdfFiles(fileInp.files);
         });
       }
 
@@ -7237,6 +7468,23 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
 
       document.getElementById('aiGenVideoUrl')?.addEventListener('input', (e) => {
         aiGenState.videoUrl = e.target.value.trim();
+      });
+      document.getElementById('aiGenVidStartMin')?.addEventListener('input', (e) => {
+        aiGenState.videoStartMin = Math.max(0, parseInt(e.target.value, 10) || 0);
+      });
+      document.getElementById('aiGenVidEndMin')?.addEventListener('input', (e) => {
+        aiGenState.videoEndMin = Math.max(5, parseInt(e.target.value, 10) || 45);
+      });
+      document.querySelectorAll('[data-yt-seg]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const [s, e] = btn.dataset.ytSeg.split(',').map(Number);
+          aiGenState.videoStartMin = s;
+          aiGenState.videoEndMin = e;
+          render();
+        });
+      });
+      document.getElementById('btnAiGenCancel')?.addEventListener('click', () => {
+        if (aiGenAbortCtrl) aiGenAbortCtrl.abort();
       });
       document.getElementById('btnAiGenFetchVid')?.addEventListener('click', () => {
         const u = document.getElementById('aiGenVideoUrl')?.value.trim() || '';
@@ -7279,7 +7527,25 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
         aiGenState.selectedChapters = [];
         render();
       });
-      document.querySelectorAll('[data-draft-chap]').forEach(sel => {
+      document.querySelectorAll('[data-rm-pdf]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          aiGenState.pdfFiles = (aiGenState.pdfFiles || []).filter(x => x.id !== btn.dataset.rmPdf);
+          syncCombinedPdfState();
+          render();
+        });
+      });
+      document.querySelectorAll('[data-draft-subj]').forEach(sel => {
+        sel.addEventListener('change', () => {
+          const d = aiGenState.drafts.find(x => x.tempId === sel.dataset.draftSubj);
+          if (d) {
+            d.subjectId = sel.value;
+            const ns = state.subjects.find(s => s.id === sel.value);
+            if (ns && ns.questions.length) d.chapter = ns.questions[0].chapter;
+            render();
+          }
+        });
+      });
+            document.querySelectorAll('[data-draft-chap]').forEach(sel => {
         sel.addEventListener('change', () => {
           const d = aiGenState.drafts.find(x => x.tempId === sel.dataset.draftChap);
           if (d) d.chapter = sel.value;
@@ -7362,7 +7628,8 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
         const resp = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
+          body: JSON.stringify(payload),
+          signal: (typeof aiGenAbortCtrl !== 'undefined' && aiGenAbortCtrl) ? aiGenAbortCtrl.signal : undefined
         });
         if (resp.ok) {
           const data = await resp.json();
@@ -7373,6 +7640,21 @@ ${aiGenState.sourceTab === 'video' && parseYouTubeVideoId(aiGenState.videoUrl)
         }
         const errBody = await resp.text();
         lastErr = `Gemini API (${resp.status} on ${mdl}): ${errBody.slice(0, 160)}`;
+        if (resp.status === 400 && payload.generationConfig && payload.generationConfig.thinkingConfig && errBody.toLowerCase().includes('thinking')) {
+          const cleanPayload = JSON.parse(JSON.stringify(payload));
+          delete cleanPayload.generationConfig.thinkingConfig;
+          const retryResp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(cleanPayload),
+            signal: (typeof aiGenAbortCtrl !== 'undefined' && aiGenAbortCtrl) ? aiGenAbortCtrl.signal : undefined
+          });
+          if (retryResp.ok) {
+            const d2 = await retryResp.json();
+            const t2 = d2?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+            if (t2) return t2;
+          }
+        }
         if (resp.status === 503 || resp.status === 429 || resp.status === 404) {
           await new Promise(r => setTimeout(r, 900));
           continue;
