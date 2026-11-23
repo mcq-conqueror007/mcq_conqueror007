@@ -6311,7 +6311,9 @@ create policy "Admin-only write MCQs" on questions for all
       generating: false,
       genProgress: '',
       subjectId: 'fa',
+      chapterMode: 'auto', // 'auto' | 'multi' | 'single'
       chapter: '',
+      selectedChapters: [],
       customChapter: '',
       count: 10,
       difficulty: 'Moderate',
@@ -6592,7 +6594,14 @@ create policy "Admin-only write MCQs" on questions for all
         return;
       }
       const subj = state.subjects.find(s => s.id === aiGenState.subjectId) || state.subjects[0];
-      const targetChapter = (aiGenState.customChapter || '').trim() || aiGenState.chapter || 'General Chapter';
+      const allSubjChapters = Array.from(new Set(subj.questions.map(q => q.chapter)));
+      const mode = aiGenState.chapterMode || 'auto';
+      const allowedChapters = mode === 'auto'
+        ? allSubjChapters
+        : mode === 'multi'
+          ? (aiGenState.selectedChapters.length ? aiGenState.selectedChapters : allSubjChapters)
+          : [(aiGenState.customChapter || '').trim() || aiGenState.chapter || allSubjChapters[0] || 'General Chapter'];
+      const isMultiChapter = mode === 'auto' || (mode === 'multi' && allowedChapters.length > 1);
       const totalWanted = Number(aiGenState.count) || 10;
       const batchSize = totalWanted > 20 ? 20 : totalWanted;
       const batches = Math.ceil(totalWanted / batchSize);
@@ -6603,8 +6612,8 @@ create policy "Admin-only write MCQs" on questions for all
       render();
 
       try {
-        const sliceLen = Math.min(srcText.length, 24000);
-        const contextChunk = srcText.slice(0, sliceLen);
+        // Slice across the full marathon transcript/PDF so all chapters in long lectures get covered evenly
+        const chunkWindow = 22000;
 
         for (let b = 0; b < batches; b++) {
           const need = Math.min(batchSize, totalWanted - aiGenState.drafts.length);
@@ -6612,12 +6621,23 @@ create policy "Admin-only write MCQs" on questions for all
           const el = document.getElementById('aiGenStatusMsg');
           if (el) el.textContent = aiGenState.genProgress;
 
+          let startPos = 0;
+          if (srcText.length > chunkWindow && batches > 1) {
+            const maxStart = srcText.length - chunkWindow;
+            startPos = Math.round((b / (batches - 1)) * maxStart);
+          }
+          const contextChunk = srcText.slice(startPos, startPos + chunkWindow);
+
           const avoidList = aiGenState.drafts.slice(-15).map(d => d.question.slice(0, 70)).join(' | ');
+          const chapterInstruction = isMultiChapter
+            ? `- Multi-Chapter Mode: Assign EACH question to the single most accurate chapter name verbatim from this list:\n  ${allowedChapters.map(c => `"${c}"`).join(', ')}`
+            : `- Chapter: ${allowedChapters[0]}`;
+
           const prompt = `Generate exactly ${need} high-quality, non-ambiguous Multiple Choice Questions strictly supported by the SOURCE MATERIAL below.
 
 PARAMETERS:
 - Subject: ${subj.name}
-- Chapter: ${targetChapter}
+${chapterInstruction}
 - Difficulty: ${aiGenState.difficulty}
 - Format: ${aiGenState.format}
 ${avoidList ? `- Do NOT repeat these already-generated questions: ${avoidList}` : ''}
@@ -6627,10 +6647,12 @@ STRICT QUALITY RULES:
 2. Provide exactly 4 distinct options (no option prefixes like "a)" or "(A)").
 3. Ensure "correctIndex" (integer 0, 1, 2, or 3) strictly matches the "explanation".
 4. Include a clear, concise 1-3 sentence "explanation".
+5. Include "chapter" matching the exact chapter name from the allowed list.
 
 Return ONLY a JSON array of objects in this exact schema:
 [
   {
+    "chapter": "${allowedChapters[0]}",
     "question": "...",
     "options": ["opt0", "opt1", "opt2", "opt3"],
     "correctIndex": 0,
@@ -6638,7 +6660,7 @@ Return ONLY a JSON array of objects in this exact schema:
   }
 ]
 
-SOURCE MATERIAL (${aiGenState.sourceName || 'Uploaded Study Material'}):
+SOURCE MATERIAL (${aiGenState.sourceName || 'Uploaded Study Material'}, Part ${b + 1}/${batches}):
 ${contextChunk}`;
 
           const parsed = await callAiForMcqJson(prompt);
@@ -6648,6 +6670,12 @@ ${contextChunk}`;
             if (!item || !item.question || !Array.isArray(item.options) || item.options.length !== 4) return;
             const ci = Number(item.correctIndex);
             if (isNaN(ci) || ci < 0 || ci > 3) return;
+            let assignedChap = allowedChapters[0];
+            if (isMultiChapter && item.chapter) {
+              const exact = allowedChapters.find(c => c.toLowerCase() === String(item.chapter).trim().toLowerCase());
+              const partial = exact || allowedChapters.find(c => c.toLowerCase().includes(String(item.chapter).trim().toLowerCase()) || String(item.chapter).trim().toLowerCase().includes(c.toLowerCase().split(':')[0]));
+              assignedChap = partial || allowedChapters[0];
+            }
             aiGenState.drafts.push({
               tempId: `draft-${Date.now()}-${b}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
               question: String(item.question).trim(),
@@ -6655,7 +6683,7 @@ ${contextChunk}`;
               correctIndex: ci,
               explanation: String(item.explanation || '').trim(),
               subjectId: subj.id,
-              chapter: targetChapter,
+              chapter: assignedChap,
               difficulty: aiGenState.difficulty,
               format: aiGenState.format,
               sourceRef: aiGenState.sourceName || 'Admin AI Generator',
@@ -6886,15 +6914,49 @@ ${(aiGenState.extractedText || '').slice(0, 16000)}`;
                   </select>
                 </div>
                 <div>
-                  <label class="block text-xs font-semibold text-slate-600 mb-1">Chapter</label>
-                  <select id="aiGenChapSel" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs sm:text-sm">
-                    ${chapters.map(c => `<option value="${escapeHtml(c)}" ${c === aiGenState.chapter ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
-                  </select>
+                  <label class="block text-xs font-semibold text-slate-600 mb-1.5">Chapter Mapping Mode</label>
+                  <div class="grid grid-cols-3 gap-1.5 bg-slate-100 p-1 rounded-xl">
+                    <button type="button" data-aigen-cmode="auto" class="py-1.5 px-2 rounded-lg text-[11px] font-bold transition ${aiGenState.chapterMode === 'auto' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-600 hover:text-slate-900'}">✨ Auto-Detect</button>
+                    <button type="button" data-aigen-cmode="multi" class="py-1.5 px-2 rounded-lg text-[11px] font-bold transition ${aiGenState.chapterMode === 'multi' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-600 hover:text-slate-900'}">Multi-Chapter</button>
+                    <button type="button" data-aigen-cmode="single" class="py-1.5 px-2 rounded-lg text-[11px] font-bold transition ${aiGenState.chapterMode === 'single' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-600 hover:text-slate-900'}">Single Chapter</button>
+                  </div>
                 </div>
-                <div>
-                  <label class="block text-xs font-semibold text-slate-600 mb-1">Or New Chapter Name (optional)</label>
-                  <input id="aiGenCustomChap" type="text" value="${escapeHtml(aiGenState.customChapter)}" placeholder="Leave blank to use selected chapter above" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs sm:text-sm" />
-                </div>
+
+                ${aiGenState.chapterMode === 'auto' ? `
+                  <div class="p-3 rounded-xl bg-indigo-50/80 border border-indigo-200 text-xs text-indigo-900 space-y-1">
+                    <div class="font-bold">Best for 4+ Hour Marathon Videos & Full PDFs</div>
+                    <p class="text-[11px] text-indigo-700">AI will automatically sort every generated MCQ into its exact matching chapter across all <strong>${chapters.length} chapters</strong> of ${escapeHtml(subj.name)}. You can also edit any question's chapter in the Review Panel.</p>
+                  </div>
+                ` : aiGenState.chapterMode === 'multi' ? `
+                  <div class="space-y-2">
+                    <div class="flex items-center justify-between text-xs">
+                      <span class="font-semibold text-slate-600">Select Chapters Covered (${aiGenState.selectedChapters.length} selected)</span>
+                      <div class="flex gap-2">
+                        <button type="button" id="btnAiGenSelAllCh" class="text-[11px] font-bold text-indigo-600 hover:underline">Select All</button>
+                        <button type="button" id="btnAiGenClearCh" class="text-[11px] font-bold text-slate-500 hover:underline">Clear</button>
+                      </div>
+                    </div>
+                    <div class="max-h-40 overflow-y-auto rounded-xl border border-slate-200 p-2 space-y-1 bg-slate-50/70">
+                      ${chapters.map(c => `
+                        <label class="flex items-center gap-2 px-2 py-1 rounded-lg hover:bg-white cursor-pointer text-xs">
+                          <input type="checkbox" data-aigen-multich="${escapeHtml(c)}" ${aiGenState.selectedChapters.includes(c) ? 'checked' : ''} class="rounded text-indigo-600" />
+                          <span class="text-slate-800 truncate">${escapeHtml(c)}</span>
+                        </label>
+                      `).join('')}
+                    </div>
+                  </div>
+                ` : `
+                  <div>
+                    <label class="block text-xs font-semibold text-slate-600 mb-1">Single Chapter</label>
+                    <select id="aiGenChapSel" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs sm:text-sm">
+                      ${chapters.map(c => `<option value="${escapeHtml(c)}" ${c === aiGenState.chapter ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+                    </select>
+                  </div>
+                  <div>
+                    <label class="block text-xs font-semibold text-slate-600 mb-1">Or New Chapter Name (optional)</label>
+                    <input id="aiGenCustomChap" type="text" value="${escapeHtml(aiGenState.customChapter)}" placeholder="Leave blank to use selected chapter above" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs sm:text-sm" />
+                  </div>
+                `}
                 <div class="grid grid-cols-3 gap-2">
                   <div>
                     <label class="block text-xs font-semibold text-slate-600 mb-1">Questions</label>
@@ -6948,6 +7010,10 @@ ${(aiGenState.extractedText || '').slice(0, 16000)}`;
                           <span>Q${idx + 1} Approved</span>
                         </label>
                         <span class="px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 text-[11px] font-bold">${escapeHtml(d.difficulty)} • ${escapeHtml(d.format)}</span>
+                        <select data-draft-chap="${d.tempId}" class="rounded-lg border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-semibold text-slate-700 max-w-[230px]" title="Assigned Chapter">
+                          ${chapters.map(c => `<option value="${escapeHtml(c)}" ${c === d.chapter ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+                          ${!chapters.includes(d.chapter) ? `<option value="${escapeHtml(d.chapter)}" selected>${escapeHtml(d.chapter)}</option>` : ''}
+                        </select>
                         ${d.isDuplicate ? `<span class="px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-[11px] font-bold" title="${escapeHtml(d.dupMatch)}">⚠ Possible Duplicate</span>` : ''}
                       </div>
                       <div class="flex items-center gap-2">
@@ -7039,7 +7105,40 @@ ${(aiGenState.extractedText || '').slice(0, 16000)}`;
       document.getElementById('aiGenSubjSel')?.addEventListener('change', (e) => {
         aiGenState.subjectId = e.target.value;
         aiGenState.chapter = '';
+        aiGenState.selectedChapters = [];
         render();
+      });
+      document.querySelectorAll('[data-aigen-cmode]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          aiGenState.chapterMode = btn.dataset.aigenCmode;
+          render();
+        });
+      });
+      document.querySelectorAll('[data-aigen-multich]').forEach(cb => {
+        cb.addEventListener('change', () => {
+          const ch = cb.dataset.aigenMultich;
+          if (cb.checked) {
+            if (!aiGenState.selectedChapters.includes(ch)) aiGenState.selectedChapters.push(ch);
+          } else {
+            aiGenState.selectedChapters = aiGenState.selectedChapters.filter(x => x !== ch);
+          }
+          render();
+        });
+      });
+      document.getElementById('btnAiGenSelAllCh')?.addEventListener('click', () => {
+        const s = state.subjects.find(x => x.id === aiGenState.subjectId) || state.subjects[0];
+        aiGenState.selectedChapters = Array.from(new Set(s.questions.map(q => q.chapter)));
+        render();
+      });
+      document.getElementById('btnAiGenClearCh')?.addEventListener('click', () => {
+        aiGenState.selectedChapters = [];
+        render();
+      });
+      document.querySelectorAll('[data-draft-chap]').forEach(sel => {
+        sel.addEventListener('change', () => {
+          const d = aiGenState.drafts.find(x => x.tempId === sel.dataset.draftChap);
+          if (d) d.chapter = sel.value;
+        });
       });
       document.getElementById('aiGenChapSel')?.addEventListener('change', (e) => { aiGenState.chapter = e.target.value; });
       document.getElementById('aiGenCustomChap')?.addEventListener('input', (e) => { aiGenState.customChapter = e.target.value; });
