@@ -1800,6 +1800,7 @@
     // 6. VIEW RENDERERS
     // =========================================================================
     function render() {
+      if (typeof _mgQuestionRegistry !== 'undefined') _mgQuestionRegistry.clear();
       destroyCharts();
       renderHeaderControls();
       const main = document.getElementById('appMain');
@@ -3077,7 +3078,13 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
                                         ${statusBadge}
                                         <span class="text-[11px] text-slate-400">⏱ ${it.actualSec}s</span>
                                       </div>
-                                      <span class="text-[11px] text-slate-400">${escapeHtml(it.chapter || '')}</span>
+                                      <div class="flex items-center gap-2">
+                                        <span class="text-[11px] text-slate-400">${escapeHtml(it.chapter || '')}</span>
+                                        <button type="button" data-ask-mg-key="${registerMgQuestionBtn({ qNum: it.qNum, total: sess.total, subjectName: sess.subjectName, chapter: it.chapter || sess.chapterLabel, question: it.question, options: it.options, userAns: it.userAns, correctIndex: it.correctIndex, sourcePdf: it.sourcePdf })}" class="inline-flex items-center gap-1 pl-1 pr-2 py-0.5 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold transition">
+                                          <img src="${MG_AVATAR_URI}" alt="MAHA GYANI" class="w-4 h-4 rounded-full object-cover" />
+                                          <span>Ask MAHA GYANI</span>
+                                        </button>
+                                      </div>
                                     </div>
                                     <p class="text-sm font-medium text-slate-900 leading-snug">${escapeHtml(it.question)}</p>
                                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
@@ -3132,9 +3139,15 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
                         <span class="text-[11px] font-bold px-2 py-0.5 rounded-md bg-rose-100 text-rose-700">Missed ${m.timesWrong}×</span>
                         ${m.isMastered ? '<span class="text-[11px] font-bold px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-700">Mastered ✓</span>' : ''}
                       </div>
-                      <button data-bookmark-mistake="${escapeHtml(m.id || '')}" class="p-1.5 rounded-lg border ${state.bookmarks[m.id] ? 'bg-amber-50 border-amber-300 text-amber-600' : 'border-slate-200 text-slate-400 hover:text-slate-700'}" title="Bookmark for Revision">
-                        <i data-lucide="bookmark" class="w-3.5 h-3.5"></i>
-                      </button>
+                      <div class="flex items-center gap-1.5">
+                        <button type="button" data-ask-mg-key="${registerMgQuestionBtn({ subjectName: m.subjectName, chapter: m.chapter, question: m.question, options: m.options, userAns: m.lastWrongAns, correctIndex: m.correctIndex, sourcePdf: m.sourcePdf })}" class="inline-flex items-center gap-1.5 pl-1 pr-2.5 py-1 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold transition">
+                          <img src="${MG_AVATAR_URI}" alt="MAHA GYANI" class="w-4 h-4 rounded-full object-cover" />
+                          <span>Ask MAHA GYANI</span>
+                        </button>
+                        <button data-bookmark-mistake="${escapeHtml(m.id || '')}" class="p-1.5 rounded-lg border ${state.bookmarks[m.id] ? 'bg-amber-50 border-amber-300 text-amber-600' : 'border-slate-200 text-slate-400 hover:text-slate-700'}" title="Bookmark for Revision">
+                          <i data-lucide="bookmark" class="w-3.5 h-3.5"></i>
+                        </button>
+                      </div>
                     </div>
                     <p class="text-sm sm:text-base font-medium text-slate-900 leading-relaxed">${escapeHtml(m.question)}</p>
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
@@ -3819,6 +3832,12 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
                           <div class="text-xs flex flex-col gap-0.5">
                             <span class="${!i.attempted ? 'text-slate-500' : (i.isCorrect ? 'text-emerald-700 font-semibold' : 'text-rose-700 font-semibold')}">Your Answer: ${escapeHtml(yourText)}</span>
                             <span class="text-emerald-700">Correct Answer: ${escapeHtml(corrText)} ${i.answerStatus === 'flagged' ? '<span class="ml-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-semibold text-[10px]">Flagged Key — Check PDF</span>' : ''}</span>
+                            <div class="pt-1">
+                              <button type="button" data-ask-mg-key="${registerMgQuestionBtn({ qNum: i.qNum, total: session.items.length, subjectName: session.subjectName, chapter: i.chapter, question: i.question, options: i.options, userAns: i.userAns, correctIndex: i.correctIndex, sourcePdf: i.sourcePdf })}" class="inline-flex items-center gap-1.5 pl-1 pr-2.5 py-1 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold transition">
+                                <img src="${MG_AVATAR_URI}" alt="MAHA GYANI" class="w-4 h-4 rounded-full object-cover" />
+                                <span>Ask MAHA GYANI</span>
+                              </button>
+                            </div>
                             ${i.sourcePdf ? `<span class="text-[11px] text-slate-400">Source: ${escapeHtml(i.sourcePdf)} (p.${escapeHtml(i.sourcePage)}, Q${escapeHtml(i.originalQNum)})</span>` : ''}
                           </div>
                         </td>
@@ -5918,7 +5937,13 @@ create policy "Admin-only write MCQs" on questions for all
                   ` : ''}
                   <div class="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-100">
                     <button id="btnQrPrev" class="px-4 py-2 rounded-xl border border-slate-300 text-xs font-semibold text-slate-700">← Prev</button>
-                    <button id="btnQrToggle" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold">${state.quickRevRevealed ? 'Hide Answer' : 'Reveal Answer'}</button>
+                    <div class="flex items-center gap-2">
+                      <button id="btnQrToggle" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold">${state.quickRevRevealed ? 'Hide Answer' : 'Reveal Answer'}</button>
+                      <button type="button" data-ask-mg-key="${registerMgQuestionBtn({ qNum: qrIdx + 1, total: qrPool.length, subjectName: currQr.subjectName, chapter: currQr.chapter, question: currQr.question, options: currQr.options, correctIndex: currQr.correctIndex, sourcePdf: currQr.sourcePdf })}" class="inline-flex items-center gap-1.5 pl-1.5 pr-3 py-1.5 rounded-xl border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold transition">
+                        <img src="${MG_AVATAR_URI}" alt="MAHA GYANI" class="w-5 h-5 rounded-full object-cover" />
+                        <span>Ask MAHA GYANI</span>
+                      </button>
+                    </div>
                     <button id="btnQrNext" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold">Next →</button>
                   </div>
                 </div>
@@ -5950,6 +5975,10 @@ create policy "Admin-only write MCQs" on questions for all
                             <option value="">Assign collection...</option>
                             ${colNames.map(c => `<option value="${escapeHtml(c)}" ${(state.bookmarkCollections[c] || []).includes(q.id) ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
                           </select>
+                          <button type="button" data-ask-mg-key="${registerMgQuestionBtn({ subjectName: q.subjectName, chapter: q.chapter, question: q.question, options: q.options, correctIndex: q.correctIndex, sourcePdf: q.sourcePdf })}" class="inline-flex items-center gap-1 pl-1 pr-2 py-0.5 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold transition">
+                            <img src="${MG_AVATAR_URI}" alt="MAHA GYANI" class="w-4 h-4 rounded-full object-cover" />
+                            <span>Ask MAHA GYANI</span>
+                          </button>
                           <button data-remove-bm="${escapeHtml(q.id)}" class="text-xs text-rose-600 hover:underline font-semibold">Remove</button>
                         </div>
                       </div>
@@ -6389,6 +6418,13 @@ create policy "Admin-only write MCQs" on questions for all
     document.getElementById('btnSmartSearchMobile')?.addEventListener('click', openSmartSearchModal);
 
     // Keyboard shortcuts: Ctrl/Cmd+Shift+A Admin, Ctrl/Cmd+K Smart Search, Escape close, 1-4 / Arrows in Practice
+    document.addEventListener('click', (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest('[data-ask-mg-key]') : null;
+      if (!btn) return;
+      const qObj = _mgQuestionRegistry.get(btn.dataset.askMgKey);
+      if (qObj) askMahaGyaniAboutQuestion(qObj);
+    });
+
     document.addEventListener('keydown', (e) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'a') {
         e.preventDefault();
@@ -7677,6 +7713,7 @@ CORE PRINCIPLES (STRICT):
       open: false,
       loading: false,
       settingsOpen: false,
+      pinnedMcq: null,
       config: {
         provider: 'gemini',
         model: 'gemini-3.5-flash-lite',
@@ -7744,7 +7781,47 @@ I solve MCQs from first principles (never blindly copying answer keys), explain 
           sourcePdf: q.sourcePdf || ''
         };
       }
+      if (!ctx.mcq && mgState.pinnedMcq) {
+        ctx.mcq = mgState.pinnedMcq;
+      }
       return ctx;
+    }
+
+    const _mgQuestionRegistry = new Map();
+    function registerMgQuestionBtn(qObj) {
+      const key = 'mgq_' + _mgQuestionRegistry.size + '_' + Math.random().toString(36).slice(2, 7);
+      _mgQuestionRegistry.set(key, qObj);
+      return key;
+    }
+
+    function askMahaGyaniAboutQuestion(qObj) {
+      if (!qObj || !qObj.question) return;
+      const letters = ['A', 'B', 'C', 'D', 'E'];
+      const opts = Array.isArray(qObj.options) ? qObj.options : [];
+      const userIdx = (typeof qObj.userAns === 'number' && qObj.userAns >= 0) ? qObj.userAns : null;
+      const corrIdx = (typeof qObj.correctIndex === 'number' && qObj.correctIndex >= 0) ? qObj.correctIndex : 0;
+      mgState.pinnedMcq = {
+        qNum: qObj.qNum || 1,
+        total: qObj.total || 1,
+        chapter: qObj.chapter || '',
+        subjectName: qObj.subjectName || '',
+        question: qObj.question,
+        options: opts,
+        userSelectedIdx: userIdx,
+        userSelectedLetter: userIdx !== null ? (letters[userIdx] || '') : null,
+        storedCorrectIndex: corrIdx,
+        storedCorrectLetter: letters[corrIdx] || '',
+        sourcePdf: qObj.sourcePdf || ''
+      };
+      openMahaGyani(false);
+      const optsLine = opts.map((o, idx) => `${letters[idx]}) ${o}`).join(' | ');
+      const wrongNote = (userIdx !== null && userIdx !== corrIdx)
+        ? `\nI chose Option ${letters[userIdx]} (${opts[userIdx] || ''}) which was marked wrong.`
+        : '';
+      sendToMahaGyani(
+        `Please solve and explain this MCQ independently:\n"${qObj.question}"\nOptions: ${optsLine}${wrongNote}\nExplain the correct answer clearly and why the other options are incorrect.`,
+        'solve'
+      );
     }
 
     function formatMgMarkdown(md) {
