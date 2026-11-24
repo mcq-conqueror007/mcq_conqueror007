@@ -6909,9 +6909,22 @@ create policy "Admin-only write MCQs" on questions for all
       const allSubjectsCatalog = isAllCombined
         ? state.subjects.map(s => `Subject ID "${s.id}" (${s.name}): [${Array.from(new Set(s.questions.map(q => q.chapter))).map(c => `"${c}"`).join(', ')}]`).join('\n')
         : '';
-      const totalWanted = Number(aiGenState.count) || 10;
-      const batchSize = totalWanted > 15 ? 15 : totalWanted;
-      const batches = Math.ceil(totalWanted / batchSize);
+      const extractAllMode = aiGenState.count === 'ALL';
+      const totalWanted = extractAllMode ? 999 : (Number(aiGenState.count) || 10);
+      const batchSize = extractAllMode ? 20 : (totalWanted > 15 ? 15 : totalWanted);
+      let batches;
+      if (extractAllMode) {
+        if (directYtUrl) {
+          const spanMin = Math.max(15, (Number(aiGenState.videoEndMin) || 20) - (Number(aiGenState.videoStartMin) || 0));
+          batches = Math.max(1, Math.min(20, Math.ceil(spanMin / 15)));
+        } else if (useDirectPdf) {
+          batches = Math.max(2, Math.min(15, Math.ceil((aiGenState.extractedPages || 10) / 3)));
+        } else {
+          batches = Math.max(1, Math.min(25, Math.ceil(srcText.length / 10000)));
+        }
+      } else {
+        batches = Math.ceil(totalWanted / batchSize);
+      }
 
       aiGenState.generating = true;
       aiGenState.errorMsg = '';
@@ -6925,28 +6938,33 @@ create policy "Admin-only write MCQs" on questions for all
       render();
 
       try {
-        const chunkWindow = 12000;
+        const chunkWindow = extractAllMode ? 10000 : 12000;
         const baseStartMin = Math.max(0, Number(aiGenState.videoStartMin) || 0);
         const baseEndMin = Math.max(baseStartMin + 5, Number(aiGenState.videoEndMin) || (baseStartMin + 20));
 
         for (let b = 0; b < batches; b++) {
           if (aiGenAbortCtrl && aiGenAbortCtrl.signal.aborted) break;
-          const need = Math.min(batchSize, totalWanted - aiGenState.drafts.length);
+          const need = extractAllMode ? 25 : Math.min(batchSize, totalWanted - aiGenState.drafts.length);
           const segStartMin = directYtUrl ? baseStartMin + Math.floor(((baseEndMin - baseStartMin) / batches) * b) : 0;
           const segEndMin = directYtUrl ? baseStartMin + Math.ceil(((baseEndMin - baseStartMin) / batches) * (b + 1)) : 0;
 
           aiGenState.genProgress = directYtUrl
-            ? `Batch ${b + 1}/${batches} (${segStartMin}m–${segEndMin}m, ${need} MCQs)...`
+            ? `Extracting slice ${b + 1}/${batches} (${segStartMin}m–${segEndMin}m • ${aiGenState.drafts.length} found so far)...`
             : useDirectPdf
-              ? `Reading PDF with Gemini Vision — batch ${b + 1}/${batches} (${need} MCQs)...`
-              : `Generating batch ${b + 1}/${batches} (${need} MCQs)...`;
+              ? `Extracting PDF Vision pass ${b + 1}/${batches} (${aiGenState.drafts.length} found so far)...`
+              : `Extracting PDF chunk ${b + 1}/${batches} (${aiGenState.drafts.length} found so far)...`;
           const el = document.getElementById('aiGenStatusMsg');
           if (el) el.textContent = aiGenState.genProgress;
 
           let startPos = 0;
           if (!directYtUrl && !useDirectPdf && srcText.length > chunkWindow && batches > 1) {
-            const maxStart = srcText.length - chunkWindow;
-            startPos = Math.round((b / (batches - 1)) * maxStart);
+            if (extractAllMode) {
+              startPos = b * chunkWindow;
+              if (startPos >= srcText.length) break;
+            } else {
+              const maxStart = srcText.length - chunkWindow;
+              startPos = Math.round((b / (batches - 1)) * maxStart);
+            }
           }
           const contextChunk = srcText.slice(startPos, startPos + chunkWindow);
 
@@ -6955,7 +6973,7 @@ create policy "Admin-only write MCQs" on questions for all
             ? `- Multi-Chapter Mode: Assign EACH question to the single most accurate chapter name verbatim from this list:\n  ${allowedChapters.map(c => `"${c}"`).join(', ')}`
             : `- Chapter: ${allowedChapters[0]}`;
 
-          const prompt = `Generate exactly ${need} high-quality, non-ambiguous Multiple Choice Questions in clean English strictly supported by the source material.
+          const prompt = `${extractAllMode ? 'Extract EVERY SINGLE Multiple Choice Question (or create MCQs covering every distinct question/concept without skipping any, up to ' + need + ' in this slice; return [] if none remain)' : 'Generate exactly ' + need + ' high-quality, non-ambiguous Multiple Choice Questions'} in clean English strictly supported by the source material.
 
 PARAMETERS:
 ${isAllCombined
@@ -6988,7 +7006,7 @@ ${directYtUrl
               : {};
 
           const parsed = await callAiForMcqJson(prompt, mediaOpts);
-          if (!Array.isArray(parsed)) continue;
+          if (!Array.isArray(parsed) || (extractAllMode && useDirectPdf && parsed.length === 0)) { if (extractAllMode && useDirectPdf) break; continue; }
 
           parsed.forEach((item, idx) => {
             if (!item || !item.question || !Array.isArray(item.options) || item.options.length !== 4) return;
@@ -7287,6 +7305,7 @@ ${vid ? 'SOURCE VIDEO: Use the attached YouTube video segment.' : useDirectPdf ?
                     <button type="button" data-yt-seg="40,60" class="px-2 py-1 rounded-lg bg-white border border-emerald-300 text-[11px] font-bold text-emerald-800 hover:bg-emerald-100">40–60m</button>
                     <button type="button" data-yt-seg="60,90" class="px-2 py-1 rounded-lg bg-white border border-emerald-300 text-[11px] font-bold text-emerald-800 hover:bg-emerald-100">60–90m</button>
                     <button type="button" data-yt-seg="90,120" class="px-2 py-1 rounded-lg bg-white border border-emerald-300 text-[11px] font-bold text-emerald-800 hover:bg-emerald-100">90–120m</button>
+                    <button type="button" data-yt-seg="0,240" class="px-2 py-1 rounded-lg bg-indigo-50 border border-indigo-300 text-[11px] font-bold text-indigo-800 hover:bg-indigo-100">Full 4h (Auto-Slice)</button>
                   </div>
                 </div>
               `}
@@ -7358,7 +7377,8 @@ ${vid ? 'SOURCE VIDEO: Use the attached YouTube video segment.' : useDirectPdf ?
                   <div>
                     <label class="block text-xs font-semibold text-slate-600 mb-1">Questions</label>
                     <select id="aiGenCountSel" class="w-full rounded-xl border border-slate-300 px-2.5 py-2 text-xs font-semibold">
-                      ${[10, 20, 50, 100].map(n => `<option value="${n}" ${Number(aiGenState.count) === n ? 'selected' : ''}>${n} Qs</option>`).join('')}
+                      <option value="ALL" ${aiGenState.count === 'ALL' ? 'selected' : ''}>✨ All Qs (Every Question)</option>
+                      ${[10, 20, 50, 100].map(n => `<option value="${n}" ${String(aiGenState.count) === String(n) ? 'selected' : ''}>${n} Qs</option>`).join('')}
                     </select>
                   </div>
                   <div>
@@ -7376,7 +7396,7 @@ ${vid ? 'SOURCE VIDEO: Use the attached YouTube video segment.' : useDirectPdf ?
                 </div>
                 <button type="button" id="btnAiGenRun" ${aiGenState.generating || aiGenState.extracting ? 'disabled' : ''} class="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white text-sm font-bold shadow-sm flex items-center justify-center gap-2 mt-2">
                   <i data-lucide="sparkles" class="w-4 h-4"></i>
-                  <span>${aiGenState.generating ? 'Generating MCQs...' : `Generate ${aiGenState.count} MCQs with AI`}</span>
+                  <span>${aiGenState.generating ? 'Extracting & Generating...' : aiGenState.count === 'ALL' ? 'Extract ALL Questions with AI' : `Generate ${aiGenState.count} MCQs with AI`}</span>
                 </button>
                 ${aiGenState.generating ? `
                   <div class="p-3 rounded-xl bg-indigo-50 border border-indigo-200 flex items-center justify-between gap-2 text-xs text-indigo-800 font-semibold">
@@ -7589,7 +7609,7 @@ ${vid ? 'SOURCE VIDEO: Use the attached YouTube video segment.' : useDirectPdf ?
       });
       document.getElementById('aiGenChapSel')?.addEventListener('change', (e) => { aiGenState.chapter = e.target.value; });
       document.getElementById('aiGenCustomChap')?.addEventListener('input', (e) => { aiGenState.customChapter = e.target.value; });
-      document.getElementById('aiGenCountSel')?.addEventListener('change', (e) => { aiGenState.count = Number(e.target.value); render(); });
+      document.getElementById('aiGenCountSel')?.addEventListener('change', (e) => { aiGenState.count = e.target.value === 'ALL' ? 'ALL' : Number(e.target.value); render(); });
       document.getElementById('aiGenDiffSel')?.addEventListener('change', (e) => { aiGenState.difficulty = e.target.value; });
       document.getElementById('aiGenFmtSel')?.addEventListener('change', (e) => { aiGenState.format = e.target.value; });
 
