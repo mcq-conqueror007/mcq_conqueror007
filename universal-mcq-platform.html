@@ -6846,6 +6846,12 @@ create policy "Admin-only write MCQs" on questions for all
             maxOutputTokens: 4096,
             responseMimeType: 'application/json'
           }
+        }, {
+          timeoutMs: (youtubeUrl || pdfBase64) ? 90000 : 45000,
+          onStatus: (msg) => {
+            const el = document.getElementById('aiGenStatusMsg');
+            if (el) el.textContent = msg;
+          }
         });
       } else {
         const url = (endpoint && endpoint.trim()) || (MG_DEFAULTS[provider]?.endpoint || 'https://api.openai.com/v1/chat/completions');
@@ -6937,12 +6943,58 @@ create policy "Admin-only write MCQs" on questions for all
       render();
 
       try {
-        const chunkWindow = extractAllMode ? 10000 : 12000;
+        const chunkWindow = extractAllMode ? 18000 : 12000;
         const baseStartMin = Math.max(0, Number(aiGenState.videoStartMin) || 0);
         const baseEndMin = Math.max(baseStartMin + 5, Number(aiGenState.videoEndMin) || (baseStartMin + 20));
+        let consecutiveErrors = 0;
+        let skippedChunks = 0;
+
+        // Build smart chunk offsets so multi-PDF uploads cover ALL uploaded books/files evenly
+        const chunkOffsets = [];
+        if (!directYtUrl && !useDirectPdf && srcText.length > 0) {
+          if (srcText.length <= chunkWindow) {
+            chunkOffsets.push(0);
+          } else if (extractAllMode && srcText.length > batches * chunkWindow) {
+            // Prioritize MCQ/Exercise sections if present, then spread evenly across all PDFs
+            const mcqHits = [];
+            const rx = /(?:Multiple\s+Choice\s+Questions|Objective\s+Type\s+Questions|Self[-\s]?Examination\s+Questions|Choose\s+the\s+correct\s+answer|EXERCISE[S]?\s*[:\n])/gi;
+            let m;
+            while ((m = rx.exec(srcText)) !== null) {
+              const pos = Math.max(0, m.index - 300);
+              if (!mcqHits.length || pos - mcqHits[mcqHits.length - 1] >= chunkWindow) {
+                mcqHits.push(pos);
+              }
+              if (mcqHits.length >= batches) break;
+            }
+            if (mcqHits.length >= Math.min(5, batches)) {
+              for (let k = 0; k < batches; k++) {
+                if (k < mcqHits.length) chunkOffsets.push(mcqHits[k]);
+                else chunkOffsets.push(Math.round((k / Math.max(1, batches - 1)) * (srcText.length - chunkWindow)));
+              }
+            } else {
+              const maxStart = srcText.length - chunkWindow;
+              for (let k = 0; k < batches; k++) {
+                chunkOffsets.push(Math.round((k / Math.max(1, batches - 1)) * maxStart));
+              }
+            }
+          } else {
+            const maxStart = Math.max(0, srcText.length - chunkWindow);
+            for (let k = 0; k < batches; k++) {
+              const pos = extractAllMode ? (k * chunkWindow) : Math.round((k / Math.max(1, batches - 1)) * maxStart);
+              if (pos < srcText.length) chunkOffsets.push(pos);
+            }
+          }
+          batches = Math.max(1, chunkOffsets.length);
+        }
 
         for (let b = 0; b < batches; b++) {
           if (aiGenAbortCtrl && aiGenAbortCtrl.signal.aborted) break;
+          // Gentle pacing between chunks to avoid Gemini Free Tier RPM throttling
+          if (b > 0) {
+            await new Promise(r => setTimeout(r, 2000));
+            if (aiGenAbortCtrl && aiGenAbortCtrl.signal.aborted) break;
+          }
+
           const need = extractAllMode ? 25 : Math.min(batchSize, totalWanted - aiGenState.drafts.length);
           const segStartMin = directYtUrl ? baseStartMin + Math.floor(((baseEndMin - baseStartMin) / batches) * b) : 0;
           const segEndMin = directYtUrl ? baseStartMin + Math.ceil(((baseEndMin - baseStartMin) / batches) * (b + 1)) : 0;
@@ -6955,16 +7007,7 @@ create policy "Admin-only write MCQs" on questions for all
           const el = document.getElementById('aiGenStatusMsg');
           if (el) el.textContent = aiGenState.genProgress;
 
-          let startPos = 0;
-          if (!directYtUrl && !useDirectPdf && srcText.length > chunkWindow && batches > 1) {
-            if (extractAllMode) {
-              startPos = b * chunkWindow;
-              if (startPos >= srcText.length) break;
-            } else {
-              const maxStart = srcText.length - chunkWindow;
-              startPos = Math.round((b / (batches - 1)) * maxStart);
-            }
-          }
+          const startPos = (!directYtUrl && !useDirectPdf && chunkOffsets.length) ? (chunkOffsets[b] || 0) : 0;
           const contextChunk = srcText.slice(startPos, startPos + chunkWindow);
 
           const avoidList = aiGenState.drafts.slice(-15).map(d => d.question.slice(0, 70)).join(' | ');
@@ -7004,7 +7047,25 @@ ${directYtUrl
               ? { pdfBase64: aiGenState.pdfBase64 }
               : {};
 
-          const parsed = await callAiForMcqJson(prompt, mediaOpts);
+          let parsed;
+          try {
+            parsed = await callAiForMcqJson(prompt, mediaOpts);
+            consecutiveErrors = 0;
+          } catch (chunkErr) {
+            if (chunkErr && chunkErr.name === 'AbortError') throw chunkErr;
+            skippedChunks++;
+            consecutiveErrors++;
+            const stEl = document.getElementById('aiGenStatusMsg');
+            if (stEl) stEl.textContent = `Chunk ${b + 1}/${batches} skipped (${(chunkErr?.message || 'API busy').slice(0, 60)}) — continuing...`;
+            if (consecutiveErrors >= 3) {
+              if (!aiGenState.drafts.length) throw chunkErr;
+              aiGenState.errorMsg = `Paused early after 3 busy chunks (${chunkErr?.message || 'API rate limit'}). All ${aiGenState.drafts.length} extracted MCQs are ready below!`;
+              break;
+            }
+            await new Promise(r => setTimeout(r, 3000));
+            continue;
+          }
+
           if (!Array.isArray(parsed) || (extractAllMode && useDirectPdf && parsed.length === 0)) { if (extractAllMode && useDirectPdf) break; continue; }
 
           parsed.forEach((item, idx) => {
@@ -7044,14 +7105,21 @@ ${directYtUrl
         }
         detectDuplicatesInDrafts(aiGenState.drafts);
         if (aiGenState.drafts.length) {
-          showToast(`Generated ${aiGenState.drafts.length} MCQs for review!`, 'success');
+          const skipNote = skippedChunks ? ` (${skippedChunks} busy chunk${skippedChunks > 1 ? 's' : ''} skipped)` : '';
+          showToast(`Generated ${aiGenState.drafts.length} MCQs for review!${skipNote}`, 'success');
         } else if (!aiGenAbortCtrl?.signal.aborted) {
           aiGenState.errorMsg = 'No valid MCQs were returned for this segment. Try another minute range or a different PDF.';
         }
       } catch (err) {
         if (err && err.name === 'AbortError') {
-          showToast('Generation cancelled.', 'info');
+          if (aiGenState.drafts.length) {
+            detectDuplicatesInDrafts(aiGenState.drafts);
+            showToast(`Stopped — kept ${aiGenState.drafts.length} MCQs for review!`, 'info');
+          } else {
+            showToast('Generation cancelled.', 'info');
+          }
         } else {
+          if (aiGenState.drafts.length) detectDuplicatesInDrafts(aiGenState.drafts);
           aiGenState.errorMsg = err.message;
         }
       } finally {
@@ -7674,47 +7742,88 @@ ${vid ? 'SOURCE VIDEO: Use the attached YouTube video segment.' : useDirectPdf ?
 
         const GEMINI_FALLBACK_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-flash-latest'];
 
-    async function fetchGeminiWithAutoFallback(preferredModel, apiKey, payload) {
+    async function fetchGeminiWithAutoFallback(preferredModel, apiKey, payload, opts = {}) {
       const chain = [preferredModel, ...GEMINI_FALLBACK_MODELS].filter((v, i, a) => v && a.indexOf(v) === i);
+      const timeoutMs = Number(opts.timeoutMs) || 45000;
+      const statusCb = typeof opts.onStatus === 'function' ? opts.onStatus : null;
       let lastErr = '';
+
       for (let i = 0; i < chain.length; i++) {
+        if (typeof aiGenAbortCtrl !== 'undefined' && aiGenAbortCtrl && aiGenAbortCtrl.signal.aborted) {
+          const abErr = new Error('Generation cancelled');
+          abErr.name = 'AbortError';
+          throw abErr;
+        }
         const mdl = chain[i];
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(mdl)}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
-        const resp = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          signal: (typeof aiGenAbortCtrl !== 'undefined' && aiGenAbortCtrl) ? aiGenAbortCtrl.signal : undefined
-        });
-        if (resp.ok) {
-          const data = await resp.json();
-          const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
-          if (text) return text;
-          lastErr = `Empty response from ${mdl}`;
-          continue;
-        }
-        const errBody = await resp.text();
-        lastErr = `Gemini API (${resp.status} on ${mdl}): ${errBody.slice(0, 160)}`;
-        if (resp.status === 400 && payload.generationConfig && payload.generationConfig.thinkingConfig && errBody.toLowerCase().includes('thinking')) {
-          const cleanPayload = JSON.parse(JSON.stringify(payload));
-          delete cleanPayload.generationConfig.thinkingConfig;
-          const retryResp = await fetch(url, {
+
+        const reqCtrl = new AbortController();
+        let timedOut = false;
+        const timer = setTimeout(() => { timedOut = true; reqCtrl.abort(); }, timeoutMs);
+        const onParentAbort = () => reqCtrl.abort();
+        const parentSig = (typeof aiGenAbortCtrl !== 'undefined' && aiGenAbortCtrl) ? aiGenAbortCtrl.signal : null;
+        if (parentSig) parentSig.addEventListener('abort', onParentAbort, { once: true });
+
+        try {
+          const resp = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(cleanPayload),
-            signal: (typeof aiGenAbortCtrl !== 'undefined' && aiGenAbortCtrl) ? aiGenAbortCtrl.signal : undefined
+            body: JSON.stringify(payload),
+            signal: reqCtrl.signal
           });
-          if (retryResp.ok) {
-            const d2 = await retryResp.json();
-            const t2 = d2?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
-            if (t2) return t2;
+          clearTimeout(timer);
+          if (parentSig) parentSig.removeEventListener('abort', onParentAbort);
+
+          if (resp.ok) {
+            const data = await resp.json();
+            const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+            if (text) return text;
+            lastErr = `Empty response from ${mdl}`;
+            continue;
           }
+          const errBody = await resp.text();
+          lastErr = `Gemini API (${resp.status} on ${mdl}): ${errBody.slice(0, 160)}`;
+          if (resp.status === 400 && payload.generationConfig && payload.generationConfig.thinkingConfig && errBody.toLowerCase().includes('thinking')) {
+            const cleanPayload = JSON.parse(JSON.stringify(payload));
+            delete cleanPayload.generationConfig.thinkingConfig;
+            const retryResp = await fetch(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(cleanPayload),
+              signal: parentSig || undefined
+            });
+            if (retryResp.ok) {
+              const d2 = await retryResp.json();
+              const t2 = d2?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+              if (t2) return t2;
+            }
+          }
+          if (resp.status === 429) {
+            if (statusCb) statusCb(`Rate limit on ${mdl} — cooling down 5s & switching model...`);
+            await new Promise(r => setTimeout(r, 5000));
+            continue;
+          }
+          if (resp.status === 503 || resp.status === 404 || resp.status === 500) {
+            if (statusCb) statusCb(`${mdl} busy (${resp.status}) — switching to fallback model...`);
+            await new Promise(r => setTimeout(r, 1200));
+            continue;
+          }
+          throw new Error(lastErr);
+        } catch (err) {
+          clearTimeout(timer);
+          if (parentSig) parentSig.removeEventListener('abort', onParentAbort);
+          if (parentSig && parentSig.aborted) {
+            const abErr = new Error('Generation cancelled');
+            abErr.name = 'AbortError';
+            throw abErr;
+          }
+          if (timedOut || (err && err.name === 'AbortError')) {
+            lastErr = `Timeout (${Math.round(timeoutMs / 1000)}s) on ${mdl}`;
+            if (statusCb) statusCb(`${mdl} timed out — switching to next model...`);
+            continue;
+          }
+          throw err;
         }
-        if (resp.status === 503 || resp.status === 429 || resp.status === 404) {
-          await new Promise(r => setTimeout(r, 900));
-          continue;
-        }
-        throw new Error(lastErr);
       }
       throw new Error(lastErr || 'All Gemini models are temporarily busy. Please try again in 15 seconds.');
     }
