@@ -884,6 +884,19 @@
       </div>
     </div>
   </header>
+  <!-- Graceful Storage Failure Warning Banner (shown only if IndexedDB/localStorage fails) -->
+  <div id="storageWarningBanner" class="hidden bg-amber-50 border-b border-amber-300 text-amber-900 px-4 py-2.5 text-xs sm:text-sm">
+    <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2">
+      <div class="flex items-center gap-2">
+        <span class="font-extrabold">Storage Warning:</span>
+        <span id="storageWarningMsg">Browser storage encountered an issue. Your current session is kept in memory—export a backup to avoid losing records.</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <button type="button" id="btnBannerBackupNow" class="px-3 py-1 rounded-lg bg-amber-700 hover:bg-amber-800 text-white font-bold text-xs">Download Backup JSON</button>
+        <button type="button" id="btnDismissStorageWarn" class="px-2 py-1 rounded-lg text-amber-800 hover:bg-amber-200/70 font-bold text-xs">Dismiss</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Main Workspace -->
   <main id="appMain" class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6"></main>
@@ -37167,7 +37180,9 @@
           notes: state.notes
         }));
       } catch (e) {
-        // Ignore storage quota or sandbox restrictions
+        if (typeof AttemptDB !== 'undefined') {
+          AttemptDB.handleStorageFailure('Could not save app state to localStorage.', e);
+        }
       }
     }
 
@@ -37478,6 +37493,7 @@
       };
 
       state.sessions.unshift(session);
+      if (typeof AttemptDB !== 'undefined') AttemptDB.recordSessionAttempts(session);
       const todayKey = getLocalDateStr();
       if (typeof updateSrsAfterSession === 'function') updateSrsAfterSession(items);
       if (!state.studyDays.includes(todayKey)) state.studyDays.push(todayKey);
@@ -39070,64 +39086,549 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
     // =========================================================================
     // PAST TESTS & MISTAKE BANK (HISTORY) SYSTEM
     // =========================================================================
-    function computeMistakeBank() {
-      const map = new Map();
-      // Iterate oldest -> newest so latest attempt determines mastery
-      const chronological = [...state.sessions].reverse();
-      chronological.forEach(sess => {
-        (sess.items || []).forEach(item => {
-          if (!item.attempted) return;
-          const key = item.id || `${sess.subjectId}::${item.question}`;
-          let rec = map.get(key);
-          if (!rec) {
-            rec = {
-              key,
-              id: item.id,
-              subjectId: sess.subjectId,
-              subjectName: sess.subjectName,
-              chapter: item.chapter || sess.chapterLabel,
-              question: item.question,
-              options: item.options || [],
-              correctIndex: item.correctIndex,
-              sourcePdf: item.sourcePdf || '',
-              sourcePage: item.sourcePage || '',
-              originalQNum: item.originalQNum || '',
-              timesAttempted: 0,
-              timesWrong: 0,
-              timesCorrect: 0,
-              lastWrongAns: null,
-              lastAttemptedAt: sess.completedAt,
-              isMastered: false
+    // =========================================================================
+    // CENTRAL ATTEMPT TRACKING SYSTEM (IndexedDB + Fallback Mirror + Per-Student Isolation)
+    // =========================================================================
+    const ATTEMPT_DB_NAME = 'mcq_conqueror_central_db_v1';
+    const ATTEMPT_DB_VERSION = 1;
+    const ATTEMPT_MIRROR_KEY = 'mcq_conq_attempts_mirror_v1';
+    const ATTEMPT_META_KEY = 'mcq_conq_attempts_meta_v1';
+
+    function getActiveStudentId() {
+      if (!state.userProfile) state.userProfile = {};
+      if (!state.userProfile.studentId) {
+        const cleanName = String(state.userProfile.name || 'student').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'student';
+        state.userProfile.studentId = `stu_${cleanName}_primary`;
+      }
+      return state.userProfile.studentId;
+    }
+
+    function showStorageWarning(msg) {
+      const banner = document.getElementById('storageWarningBanner');
+      const txt = document.getElementById('storageWarningMsg');
+      if (txt && msg) txt.textContent = msg;
+      if (banner) banner.classList.remove('hidden');
+      if (typeof showToast === 'function') showToast(msg || 'Storage save failed — download a JSON backup.', 'error');
+    }
+
+    const AttemptDB = {
+      _db: null,
+      _cache: [],          // All immutable attempt records across students in memory
+      _dedupeSet: new Set(),
+      _idSet: new Set(),
+      _ready: false,
+      _storageMode: 'indexeddb',
+      lastStorageError: null,
+      cloudAdapter: null,  // Reserved for future optional cloud sync (local-first by default)
+      meta: {
+        schemaVersion: 1,
+        masteryThreshold: 3, // Configurable rule: 3 consecutive correct answers for 'Consistently Correct'
+        lastBackupAt: null
+      },
+
+      loadMeta() {
+        try {
+          const raw = localStorage.getItem(ATTEMPT_META_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object') {
+              this.meta = { ...this.meta, ...parsed };
+            }
+          }
+        } catch (_) {}
+        if (!Number.isInteger(this.meta.masteryThreshold) || this.meta.masteryThreshold < 2 || this.meta.masteryThreshold > 10) {
+          this.meta.masteryThreshold = 3;
+        }
+      },
+
+      saveMeta() {
+        try {
+          localStorage.setItem(ATTEMPT_META_KEY, JSON.stringify(this.meta));
+        } catch (err) {
+          this.handleStorageFailure('Could not save tracking settings to local storage.', err);
+        }
+        if (this._db) {
+          try {
+            const tx = this._db.transaction(['meta'], 'readwrite');
+            tx.objectStore('meta').put({ key: 'config', value: this.meta });
+          } catch (_) {}
+        }
+      },
+
+      getMasteryThreshold() {
+        return this.meta.masteryThreshold || 3;
+      },
+
+      setMasteryThreshold(n) {
+        const val = Math.min(10, Math.max(2, parseInt(n, 10) || 3));
+        this.meta.masteryThreshold = val;
+        this.saveMeta();
+      },
+
+      getLastBackupAt() {
+        return this.meta.lastBackupAt || null;
+      },
+
+      markBackupCompleted() {
+        this.meta.lastBackupAt = new Date().toISOString();
+        this.saveMeta();
+      },
+
+      handleStorageFailure(userMsg, err) {
+        this.lastStorageError = { message: userMsg, detail: err ? String(err.message || err) : '', at: new Date().toISOString() };
+        showStorageWarning(`${userMsg} (${this.lastStorageError.detail || 'Storage unavailable'}). Please export a backup JSON.`);
+      },
+
+      validateRecord(rec) {
+        if (!rec || typeof rec !== 'object') return null;
+        const questionId = String(rec.questionId || rec.id || '').trim();
+        const questionText = String(rec.questionText || rec.question || '').trim();
+        if (!questionId && !questionText) return null;
+        const options = Array.isArray(rec.options) ? rec.options.map(o => String(o ?? '')) : [];
+        const selectedIndex = (rec.selectedIndex !== undefined && rec.selectedIndex !== null) ? Number(rec.selectedIndex) : null;
+        const correctIndex = (rec.correctIndex !== undefined && rec.correctIndex !== null) ? Number(rec.correctIndex) : 0;
+        const isCorrect = typeof rec.isCorrect === 'boolean'
+          ? rec.isCorrect
+          : (selectedIndex !== null && selectedIndex === correctIndex);
+        const timestamp = rec.timestamp && !Number.isNaN(Date.parse(rec.timestamp))
+          ? new Date(rec.timestamp).toISOString()
+          : new Date().toISOString();
+        const studentId = String(rec.studentId || getActiveStudentId());
+        const sessionId = String(rec.sessionId || 'sess-legacy');
+        const qIdFinal = questionId || `${rec.subjectId || 'gen'}::${questionText.slice(0, 64)}`;
+        const attemptId = String(rec.attemptId || `att_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`);
+        const tsSec = timestamp.slice(0, 19);
+        const dedupeKey = String(rec.dedupeKey || `${studentId}|${sessionId}|${qIdFinal}|${selectedIndex}|${tsSec}`);
+
+        return {
+          attemptId,
+          studentId,
+          questionId: qIdFinal,
+          questionText,
+          options,
+          selectedIndex,
+          selectedText: selectedIndex !== null && options[selectedIndex] !== undefined ? options[selectedIndex] : String(rec.selectedText || ''),
+          correctIndex,
+          correctText: options[correctIndex] !== undefined ? options[correctIndex] : String(rec.correctText || ''),
+          isCorrect,
+          subjectId: String(rec.subjectId || 'general'),
+          subjectName: String(rec.subjectName || 'CMA Intermediate'),
+          chapter: String(rec.chapter || 'General'),
+          difficulty: String(rec.difficulty || 'medium').toLowerCase(),
+          timestamp,
+          sessionId,
+          sessionLabel: String(rec.sessionLabel || rec.chapter || 'Practice'),
+          timeTakenSec: Math.max(0, Number(rec.timeTakenSec) || 0),
+          sourcePdf: String(rec.sourcePdf || ''),
+          sourcePage: String(rec.sourcePage || ''),
+          originalQNum: String(rec.originalQNum || ''),
+          dedupeKey
+        };
+      },
+
+      _addToCache(validRec) {
+        if (this._idSet.has(validRec.attemptId) || this._dedupeSet.has(validRec.dedupeKey)) {
+          return false;
+        }
+        this._idSet.add(validRec.attemptId);
+        this._dedupeSet.add(validRec.dedupeKey);
+        this._cache.push(validRec);
+        return true;
+      },
+
+      _persistMirror() {
+        try {
+          localStorage.setItem(ATTEMPT_MIRROR_KEY, JSON.stringify(this._cache));
+          return true;
+        } catch (err) {
+          // If localStorage is full, IndexedDB still holds the full history; warn only if IDB is also unavailable
+          if (!this._db) {
+            this.handleStorageFailure('Local storage quota exceeded and IndexedDB is unavailable.', err);
+          }
+          return false;
+        }
+      },
+
+      _putToIdb(records) {
+        if (!this._db || !records.length) return Promise.resolve(false);
+        return new Promise((resolve) => {
+          try {
+            const tx = this._db.transaction(['attempts'], 'readwrite');
+            const store = tx.objectStore('attempts');
+            for (const r of records) store.put(r);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = (e) => {
+              this.handleStorageFailure('IndexedDB write failed.', e?.target?.error || e);
+              resolve(false);
             };
-            map.set(key, rec);
-          }
-          rec.timesAttempted += 1;
-          rec.lastAttemptedAt = sess.completedAt;
-          // Refresh question/options/correctIndex from live DEFAULT_SUBJECTS if available
-          const liveSubj = state.subjects.find(s => s.id === sess.subjectId);
-          const liveQ = liveSubj ? liveSubj.questions.find(q => q.id === item.id) : null;
-          if (liveQ) {
-            rec.question = liveQ.question;
-            rec.options = liveQ.options;
-            rec.correctIndex = liveQ.correctIndex;
-          }
-          if (item.isCorrect) {
-            rec.timesCorrect += 1;
-            rec.isMastered = true;
-          } else {
-            rec.timesWrong += 1;
-            rec.lastWrongAns = item.userAns;
-            rec.isMastered = false;
+          } catch (err) {
+            this.handleStorageFailure('IndexedDB transaction failed.', err);
+            resolve(false);
           }
         });
-      });
+      },
 
-      return Array.from(map.values())
-        .filter(r => r.timesWrong > 0)
+      openIndexedDB() {
+        return new Promise((resolve) => {
+          if (typeof indexedDB === 'undefined') {
+            this._storageMode = 'localstorage-fallback';
+            resolve(null);
+            return;
+          }
+          try {
+            const req = indexedDB.open(ATTEMPT_DB_NAME, ATTEMPT_DB_VERSION);
+            req.onupgradeneeded = (e) => {
+              const db = e.target.result;
+              if (!db.objectStoreNames.contains('attempts')) {
+                const st = db.createObjectStore('attempts', { keyPath: 'attemptId' });
+                st.createIndex('studentId', 'studentId', { unique: false });
+                st.createIndex('questionId', 'questionId', { unique: false });
+                st.createIndex('subjectId', 'subjectId', { unique: false });
+                st.createIndex('timestamp', 'timestamp', { unique: false });
+                st.createIndex('sessionId', 'sessionId', { unique: false });
+                st.createIndex('dedupeKey', 'dedupeKey', { unique: true });
+              }
+              if (!db.objectStoreNames.contains('meta')) {
+                db.createObjectStore('meta', { keyPath: 'key' });
+              }
+            };
+            req.onsuccess = (e) => {
+              this._db = e.target.result;
+              this._storageMode = 'indexeddb';
+              resolve(this._db);
+            };
+            req.onerror = (e) => {
+              this._storageMode = 'localstorage-fallback';
+              this.handleStorageFailure('IndexedDB could not be opened; using fallback storage.', e?.target?.error);
+              resolve(null);
+            };
+          } catch (err) {
+            this._storageMode = 'localstorage-fallback';
+            this.handleStorageFailure('IndexedDB initialization error; using fallback storage.', err);
+            resolve(null);
+          }
+        });
+      },
+
+      loadFromMirrorSync() {
+        try {
+          const raw = localStorage.getItem(ATTEMPT_MIRROR_KEY);
+          if (raw) {
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr)) {
+              for (const r of arr) {
+                const v = this.validateRecord(r);
+                if (v) this._addToCache(v);
+              }
+            }
+          }
+        } catch (_) {}
+      },
+
+      migrateLegacySessions(sessionsList) {
+        if (!Array.isArray(sessionsList) || !sessionsList.length) return [];
+        const studentId = getActiveStudentId();
+        const added = [];
+        // Oldest -> newest to preserve true chronology
+        const ordered = [...sessionsList].reverse();
+        ordered.forEach(sess => {
+          const sessId = sess.id || 'sess-legacy';
+          const ts = sess.completedAt || new Date().toISOString();
+          (sess.items || []).forEach((item, idx) => {
+            if (!item || !item.attempted) return;
+            const qId = item.id || `${sess.subjectId}::${item.question}`;
+            const v = this.validateRecord({
+              attemptId: `mig_${studentId}_${sessId}_${qId}_${idx}`,
+              studentId,
+              questionId: qId,
+              questionText: item.question,
+              options: item.options || [],
+              selectedIndex: item.userAns,
+              correctIndex: item.correctIndex,
+              isCorrect: !!item.isCorrect,
+              subjectId: sess.subjectId,
+              subjectName: sess.subjectName,
+              chapter: item.chapter || sess.chapterLabel || 'General',
+              difficulty: item.difficulty || 'medium',
+              timestamp: ts,
+              sessionId: sessId,
+              sessionLabel: sess.chapterLabel || item.chapter || 'Practice',
+              timeTakenSec: item.actualSec || 0,
+              sourcePdf: item.sourcePdf || '',
+              sourcePage: item.sourcePage || '',
+              originalQNum: item.originalQNum || ''
+            });
+            if (v && this._addToCache(v)) added.push(v);
+          });
+        });
+        if (added.length) {
+          this._persistMirror();
+          this._putToIdb(added);
+        }
+        return added;
+      },
+
+      initSync() {
+        this.loadMeta();
+        this.loadFromMirrorSync();
+        this.migrateLegacySessions(state.sessions || []);
+        this._ready = true;
+      },
+
+      async initAsync() {
+        const db = await this.openIndexedDB();
+        if (!db) return;
+        try {
+          const idbRecords = await new Promise((resolve) => {
+            const tx = db.transaction(['attempts'], 'readonly');
+            const req = tx.objectStore('attempts').getAll();
+            req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : []);
+            req.onerror = () => resolve([]);
+          });
+          let loadedNew = false;
+          for (const r of idbRecords) {
+            const v = this.validateRecord(r);
+            if (v && this._addToCache(v)) loadedNew = true;
+          }
+          // Sync any cached/migrated records back into IndexedDB
+          const idbIds = new Set(idbRecords.map(r => r.attemptId));
+          const toPush = this._cache.filter(r => !idbIds.has(r.attemptId));
+          if (toPush.length) await this._putToIdb(toPush);
+          if (loadedNew) {
+            this._persistMirror();
+            if (typeof updateNavMistakeBadge === 'function') updateNavMistakeBadge();
+            if (state.activeNav === 'history' || state.activeNav === 'analytics') render();
+          }
+        } catch (err) {
+          this.handleStorageFailure('Failed reading saved history from IndexedDB.', err);
+        }
+      },
+
+      recordAttempt(rawRec) {
+        const v = this.validateRecord({ ...rawRec, studentId: rawRec.studentId || getActiveStudentId() });
+        if (!v) return { ok: false, reason: 'invalid' };
+        if (!this._addToCache(v)) return { ok: false, reason: 'duplicate', record: v };
+        const mirrorOk = this._persistMirror();
+        this._putToIdb([v]);
+        return { ok: true, persisted: mirrorOk || Boolean(this._db), record: v };
+      },
+
+      recordSessionAttempts(session) {
+        if (!session || !Array.isArray(session.items)) return [];
+        const studentId = getActiveStudentId();
+        const saved = [];
+        session.items.forEach((item, idx) => {
+          if (!item || !item.attempted) return;
+          const res = this.recordAttempt({
+            attemptId: `att_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 7)}`,
+            studentId,
+            questionId: item.id || `${session.subjectId}::${item.question}`,
+            questionText: item.question,
+            options: item.options || [],
+            selectedIndex: item.userAns,
+            correctIndex: item.correctIndex,
+            isCorrect: !!item.isCorrect,
+            subjectId: session.subjectId,
+            subjectName: session.subjectName,
+            chapter: item.chapter || session.chapterLabel || 'General',
+            difficulty: item.difficulty || 'medium',
+            timestamp: session.completedAt || new Date().toISOString(),
+            sessionId: session.id,
+            sessionLabel: session.chapterLabel || item.chapter || 'Practice',
+            timeTakenSec: item.actualSec || 0,
+            sourcePdf: item.sourcePdf || '',
+            sourcePage: item.sourcePage || '',
+            originalQNum: item.originalQNum || ''
+          });
+          if (res.ok) saved.push(res.record);
+        });
+        return saved;
+      },
+
+      getAttemptsForStudent(studentId = getActiveStudentId()) {
+        return this._cache
+          .filter(r => r.studentId === studentId)
+          .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+      },
+
+      computeLearningStatus(totalAttempts, totalWrong, consecutiveCorrect) {
+        const threshold = this.getMasteryThreshold();
+        if (consecutiveCorrect >= threshold) return 'Consistently Correct';
+        if (consecutiveCorrect >= 2) return 'Under Revision';
+        if (consecutiveCorrect === 1) return 'Corrected Once';
+        // consecutiveCorrect === 0 (most recent attempt was wrong)
+        if (totalAttempts <= 1 && totalWrong === 1) return 'Not Revised';
+        return 'Under Revision';
+      },
+
+      getConsolidatedQuestions(studentId = getActiveStudentId()) {
+        const attempts = this._cache
+          .filter(r => r.studentId === studentId)
+          .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp)); // oldest -> newest
+
+        const map = new Map();
+        for (const att of attempts) {
+          let rec = map.get(att.questionId);
+          if (!rec) {
+            // Pull freshest text/options from live subject bank when available
+            const liveSubj = (state.subjects || []).find(s => s.id === att.subjectId);
+            const liveQ = liveSubj ? (liveSubj.questions || []).find(q => q.id === att.questionId) : null;
+            rec = {
+              key: att.questionId,
+              id: att.questionId,
+              questionId: att.questionId,
+              subjectId: att.subjectId,
+              subjectName: (liveSubj && liveSubj.name) || att.subjectName,
+              chapter: (liveQ && liveQ.chapter) || att.chapter,
+              difficulty: (liveQ && liveQ.difficulty) || att.difficulty || 'medium',
+              question: (liveQ && liveQ.question) || att.questionText,
+              options: (liveQ && liveQ.options) || att.options || [],
+              correctIndex: (liveQ && liveQ.correctIndex !== undefined) ? liveQ.correctIndex : att.correctIndex,
+              sourcePdf: (liveQ && liveQ.sourcePdf) || att.sourcePdf || '',
+              sourcePage: (liveQ && liveQ.sourcePage) || att.sourcePage || '',
+              originalQNum: (liveQ && liveQ.originalQNum) || att.originalQNum || '',
+              totalAttempts: 0,
+              timesAttempted: 0,
+              totalWrong: 0,
+              timesWrong: 0,
+              totalCorrect: 0,
+              timesCorrect: 0,
+              consecutiveCorrect: 0,
+              everWrong: false,
+              isRepeatedMistake: false,
+              lastWrongAns: null,
+              lastSelectedAns: null,
+              lastIsCorrect: false,
+              firstAttemptedAt: att.timestamp,
+              lastAttemptedAt: att.timestamp,
+              totalTimeSec: 0,
+              selectedAnswers: [],
+              attempts: []
+            };
+            map.set(att.questionId, rec);
+          }
+
+          rec.totalAttempts += 1;
+          rec.timesAttempted = rec.totalAttempts;
+          rec.lastAttemptedAt = att.timestamp;
+          rec.lastSelectedAns = att.selectedIndex;
+          rec.lastIsCorrect = att.isCorrect;
+          rec.totalTimeSec += (att.timeTakenSec || 0);
+          rec.attempts.push(att);
+          rec.selectedAnswers.push({
+            selectedIndex: att.selectedIndex,
+            selectedText: att.selectedText,
+            isCorrect: att.isCorrect,
+            timestamp: att.timestamp,
+            sessionId: att.sessionId,
+            timeTakenSec: att.timeTakenSec
+          });
+
+          if (att.isCorrect) {
+            rec.totalCorrect += 1;
+            rec.timesCorrect = rec.totalCorrect;
+            rec.consecutiveCorrect += 1;
+          } else {
+            rec.totalWrong += 1;
+            rec.timesWrong = rec.totalWrong;
+            rec.consecutiveCorrect = 0;
+            rec.everWrong = true;
+            rec.lastWrongAns = att.selectedIndex;
+          }
+        }
+
+        return Array.from(map.values()).map(rec => {
+          rec.accuracyPct = rec.totalAttempts > 0 ? Number(((rec.totalCorrect / rec.totalAttempts) * 100).toFixed(1)) : 0;
+          rec.avgTimeSec = rec.totalAttempts > 0 ? Math.round(rec.totalTimeSec / rec.totalAttempts) : 0;
+          rec.isRepeatedMistake = rec.totalWrong >= 2;
+          rec.learningStatus = this.computeLearningStatus(rec.totalAttempts, rec.totalWrong, rec.consecutiveCorrect);
+          rec.isMastered = rec.learningStatus === 'Consistently Correct';
+          rec.isCorrected = rec.everWrong && rec.lastIsCorrect;
+          rec.isUnresolved = rec.everWrong && !rec.isMastered;
+          return rec;
+        });
+      },
+
+      exportBackupPayload({ mistakesOnly = false } = {}) {
+        const studentId = getActiveStudentId();
+        let attempts = this.getAttemptsForStudent(studentId);
+        if (mistakesOnly) {
+          const mistakeQIds = new Set(this.getConsolidatedQuestions(studentId).filter(q => q.everWrong).map(q => q.questionId));
+          attempts = attempts.filter(a => mistakeQIds.has(a.questionId));
+        }
+        return {
+          app: 'MCQ CONQUEROR',
+          exportType: mistakesOnly ? 'mistake_bank_json' : 'complete_history_backup',
+          schemaVersion: 1,
+          exportedAt: new Date().toISOString(),
+          studentId,
+          studentName: (state.userProfile && state.userProfile.name) || 'MD. RAID',
+          masteryThreshold: this.getMasteryThreshold(),
+          totalRecords: attempts.length,
+          attempts
+        };
+      },
+
+      exportCsvString({ mistakesOnly = false } = {}) {
+        const payload = this.exportBackupPayload({ mistakesOnly });
+        const letters = ['A', 'B', 'C', 'D', 'E'];
+        const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+        const headers = ['AttemptID', 'Timestamp', 'Subject', 'Chapter', 'Difficulty', 'QuestionID', 'Question', 'SelectedOption', 'CorrectOption', 'Status', 'TimeSec', 'SessionID'];
+        const rows = payload.attempts.map(a => [
+          a.attemptId,
+          a.timestamp,
+          a.subjectName,
+          a.chapter,
+          a.difficulty,
+          a.questionId,
+          a.questionText,
+          a.selectedIndex !== null ? `${letters[a.selectedIndex] || a.selectedIndex}: ${a.selectedText}` : 'Unattempted',
+          `${letters[a.correctIndex] || a.correctIndex}: ${a.correctText}`,
+          a.isCorrect ? 'Correct' : 'Incorrect',
+          a.timeTakenSec,
+          a.sessionId
+        ].map(esc).join(','));
+        return [headers.join(','), ...rows].join('\n');
+      },
+
+      mergeImportPayload(rawJson) {
+        let parsed = typeof rawJson === 'string' ? JSON.parse(rawJson) : rawJson;
+        const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.attempts) ? parsed.attempts : null);
+        if (!list) throw new Error('Invalid backup format: missing attempts array.');
+
+        const currentStudentId = getActiveStudentId();
+        let imported = 0;
+        let duplicates = 0;
+        let invalid = 0;
+        const newlyAdded = [];
+
+        for (const item of list) {
+          // Bind imported records cleanly to the active student profile on restore/merge
+          const v = this.validateRecord({ ...item, studentId: currentStudentId });
+          if (!v) { invalid++; continue; }
+          if (this._addToCache(v)) {
+            imported++;
+            newlyAdded.push(v);
+          } else {
+            duplicates++;
+          }
+        }
+
+        if (newlyAdded.length) {
+          this._persistMirror();
+          this._putToIdb(newlyAdded);
+        }
+        return { imported, duplicates, invalid, totalProcessed: list.length };
+      }
+    };
+
+    function computeMistakeBank() {
+      return AttemptDB.getConsolidatedQuestions()
+        .filter(q => q.everWrong)
         .sort((a, b) => {
           if (a.isMastered !== b.isMastered) return a.isMastered ? 1 : -1;
           if (b.timesWrong !== a.timesWrong) return b.timesWrong - a.timesWrong;
-          return new Date(b.lastAttemptedAt) - new Date(a.lastAttemptedAt);
+          return Date.parse(b.lastAttemptedAt) - Date.parse(a.lastAttemptedAt);
         });
     }
 
@@ -39143,367 +39644,810 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
       }
     }
 
-    function renderHistoryView() {
-      const allSessions = state.sessions || [];
-      const mistakes = computeMistakeBank();
-      const activeMistakes = mistakes.filter(m => !m.isMastered);
-      const masteredMistakes = mistakes.filter(m => m.isMastered);
+    // =========================================================================
+    // UNIFIED HISTORY, CONSOLIDATED MISTAKE BANK, SMART REVISION & BACKUP UI
+    // =========================================================================
+    const HIST_STATUS_BADGE = {
+      'Not Revised': 'bg-rose-100 text-rose-800 border-rose-200',
+      'Under Revision': 'bg-amber-100 text-amber-800 border-amber-200',
+      'Corrected Once': 'bg-sky-100 text-sky-800 border-sky-200',
+      'Consistently Correct': 'bg-emerald-100 text-emerald-800 border-emerald-200'
+    };
 
-      const subjFilter = state.historySubjectFilter || 'all';
-      const filteredSessions = subjFilter === 'all'
-        ? allSessions
-        : allSessions.filter(s => s.subjectId === subjFilter);
+    function getHistoryFilters() {
+      if (!state.histFilters) {
+        state.histFilters = {
+          search: '',
+          subject: state.historySubjectFilter || 'all',
+          chapter: 'all',
+          dateRange: 'all',
+          status: 'all',          // all | wrong | correct (last attempt status)
+          difficulty: 'all',
+          minWrong: '0',
+          learningStatus: 'all',
+          repeatedOnly: false,
+          sessionId: 'all',
+          sortBy: 'newest'
+        };
+      }
+      return state.histFilters;
+    }
 
-      const totalSolved = allSessions.reduce((sum, s) => sum + (s.correct || 0) + (s.wrong || 0), 0);
-      const totalCorrect = allSessions.reduce((sum, s) => sum + (s.correct || 0), 0);
-      const overallAcc = totalSolved > 0 ? ((totalCorrect / totalSolved) * 100).toFixed(1) : '—';
+    function downloadTextFile(content, filename, mimeType) {
+      try {
+        const blob = new Blob([content], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { try { a.remove(); URL.revokeObjectURL(url); } catch (_) {} }, 500);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
 
-      const subTab = state.historySubTab || 'tests';
+    function downloadAttemptBackupJson(mistakesOnly = false) {
+      const payload = AttemptDB.exportBackupPayload({ mistakesOnly });
+      const dateSlug = new Date().toISOString().slice(0, 10);
+      const fname = mistakesOnly
+        ? `MCQ_CONQUEROR_Mistakes_Backup_${dateSlug}.json`
+        : `MCQ_CONQUEROR_Complete_History_${dateSlug}.json`;
+      const ok = downloadTextFile(JSON.stringify(payload, null, 2), fname, 'application/json');
+      AttemptDB.markBackupCompleted();
+      if (typeof showToast === 'function') {
+        showToast(ok ? `Exported ${payload.totalRecords} records to ${fname}` : 'Backup prepared.', 'success');
+      }
+      if (state.activeNav === 'history') render();
+      return payload;
+    }
+
+    function downloadAttemptBackupCsv(mistakesOnly = false) {
+      const csv = AttemptDB.exportCsvString({ mistakesOnly });
+      const dateSlug = new Date().toISOString().slice(0, 10);
+      const fname = mistakesOnly
+        ? `MCQ_CONQUEROR_Mistakes_${dateSlug}.csv`
+        : `MCQ_CONQUEROR_History_${dateSlug}.csv`;
+      downloadTextFile(csv, fname, 'text/csv;charset=utf-8');
+      AttemptDB.markBackupCompleted();
+      if (typeof showToast === 'function') showToast(`Exported CSV: ${fname}`, 'success');
+      if (state.activeNav === 'history') render();
+      return csv;
+    }
+
+    function buildQuestionObjectsFromConsolidated(list) {
+      return list.map(m => {
+        const subj = (state.subjects || []).find(s => s.id === m.subjectId);
+        const live = subj ? (subj.questions || []).find(q => q.id === m.questionId) : null;
+        return live || {
+          id: m.questionId,
+          chapter: m.chapter,
+          topic: 'Smart Revision',
+          question: m.question,
+          options: m.options,
+          correctIndex: m.correctIndex,
+          type: 'mcq',
+          difficulty: m.difficulty || 'medium',
+          sourcePdf: m.sourcePdf || '',
+          sourcePage: m.sourcePage || '',
+          originalQNum: m.originalQNum || ''
+        };
+      });
+    }
+
+    function launchSmartRevisionMode(mode) {
+      const f = getHistoryFilters();
+      const allMistakes = computeMistakeBank();
+      let pool = [];
+      let label = 'Smart Revision';
+
+      if (mode === 'all_mistakes') {
+        pool = allMistakes;
+        label = 'Smart Revision: All Mistakes';
+      } else if (mode === 'unresolved') {
+        pool = allMistakes.filter(m => !m.isMastered);
+        label = 'Smart Revision: Unresolved Mistakes';
+      } else if (mode === 'repeated') {
+        pool = allMistakes.filter(m => m.isRepeatedMistake);
+        label = 'Smart Revision: Repeated Mistakes (2+x)';
+      } else if (mode === 'subject') {
+        const subjId = f.subject !== 'all' ? f.subject : (allMistakes[0]?.subjectId || state.activeSubjectId);
+        pool = allMistakes.filter(m => m.subjectId === subjId);
+        const sObj = state.subjects.find(s => s.id === subjId);
+        label = `Smart Revision: ${(sObj && sObj.code) || subjId} Mistakes`;
+      } else if (mode === 'chapter') {
+        const chap = f.chapter !== 'all' ? f.chapter : (allMistakes[0]?.chapter || '');
+        pool = allMistakes.filter(m => m.chapter === chap);
+        label = `Smart Revision: ${chap || 'Chapter'}`;
+      } else if (mode === 'corrected') {
+        pool = allMistakes.filter(m => m.isCorrected);
+        label = 'Smart Revision: Previously Corrected';
+      } else if (mode === 'random') {
+        pool = [...allMistakes].sort(() => Math.random() - 0.5).slice(0, 20);
+        label = 'Smart Revision: Random Mistakes';
+      }
+
+      if (!pool.length) {
+        if (typeof showToast === 'function') showToast('No matching questions found for this revision mode yet.', 'info');
+        return false;
+      }
+
+      const targetSubjId = (f.subject !== 'all' && mode === 'subject') ? f.subject : pool[0].subjectId;
+      const qs = buildQuestionObjectsFromConsolidated(pool);
+      startQuiz(targetSubjId, qs, label);
+      return true;
+    }
+
+    function openQuestionHistoryModal(questionId) {
+      const rec = AttemptDB.getConsolidatedQuestions().find(q => q.questionId === questionId);
+      if (!rec) return;
       const letters = ['A', 'B', 'C', 'D', 'E'];
+      const threshold = AttemptDB.getMasteryThreshold();
+      const badgeCls = HIST_STATUS_BADGE[rec.learningStatus] || 'bg-slate-100 text-slate-700 border-slate-200';
 
-      // Filter mistakes for Mistake Bank tab
-      let filteredMistakes = mistakes.filter(m => subjFilter === 'all' || m.subjectId === subjFilter);
-      const mStatus = state.mistakeStatusFilter || 'active';
-      if (mStatus === 'active') filteredMistakes = filteredMistakes.filter(m => !m.isMastered);
-      else if (mStatus === 'mastered') filteredMistakes = filteredMistakes.filter(m => m.isMastered);
+      const optsHtml = (rec.options || []).map((opt, idx) => {
+        const isCorr = idx === rec.correctIndex;
+        return `<div class="px-3 py-2 rounded-lg text-xs border ${isCorr ? 'bg-emerald-50 border-emerald-300 text-emerald-900 font-semibold' : 'bg-slate-50 border-slate-200 text-slate-700'}">
+          <strong>(${letters[idx] || idx + 1})</strong> ${escapeHtml(opt)} ${isCorr ? '<span class="ml-1 text-emerald-700 font-bold">✓ Correct</span>' : ''}
+        </div>`;
+      }).join('');
 
-      const activeFilteredCount = mistakes.filter(m => !m.isMastered && (subjFilter === 'all' || m.subjectId === subjFilter)).length;
+      const timelineHtml = [...rec.attempts].reverse().map((att, i) => {
+        const attemptNum = rec.attempts.length - i;
+        const selLetter = att.selectedIndex !== null ? (letters[att.selectedIndex] || att.selectedIndex) : '—';
+        return `
+          <div class="flex items-start gap-3 p-2.5 rounded-xl border ${att.isCorrect ? 'bg-emerald-50/60 border-emerald-200' : 'bg-rose-50/60 border-rose-200'}">
+            <div class="w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-extrabold shrink-0 ${att.isCorrect ? 'bg-emerald-600 text-white' : 'bg-rose-600 text-white'}">${attemptNum}</div>
+            <div class="min-w-0 flex-1 text-xs">
+              <div class="flex flex-wrap items-center justify-between gap-1">
+                <span class="font-bold ${att.isCorrect ? 'text-emerald-800' : 'text-rose-800'}">${att.isCorrect ? 'Correct' : 'Incorrect'} • Selected (${selLetter})</span>
+                <span class="text-[11px] text-slate-500">${new Date(att.timestamp).toLocaleString()}</span>
+              </div>
+              <div class="text-slate-600 mt-0.5 truncate">${escapeHtml(att.selectedText || '—')}</div>
+              <div class="text-[10px] text-slate-500 mt-0.5">Session: ${escapeHtml(att.sessionLabel || att.sessionId)} • Time: ${att.timeTakenSec || 0}s</div>
+            </div>
+          </div>`;
+      }).join('');
+
+      const bodyHtml = `
+        <div class="space-y-4">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">${escapeHtml(rec.subjectName)}</span>
+            <span class="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-slate-100 text-slate-700">${escapeHtml(rec.chapter)}</span>
+            <span class="text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${badgeCls}">${escapeHtml(rec.learningStatus)} (${rec.consecutiveCorrect}/${threshold} streak)</span>
+          </div>
+
+          <div class="text-sm font-bold text-slate-900 leading-relaxed">${escapeHtml(rec.question)}</div>
+          <div class="space-y-1.5">${optsHtml}</div>
+
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+            <div class="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+              <div class="text-[10px] text-slate-500 font-semibold">Total Attempts</div>
+              <div class="text-base font-extrabold text-slate-900">${rec.totalAttempts}</div>
+            </div>
+            <div class="p-2.5 rounded-xl bg-rose-50 border border-rose-200">
+              <div class="text-[10px] text-rose-700 font-semibold">Incorrect</div>
+              <div class="text-base font-extrabold text-rose-700">${rec.totalWrong}</div>
+            </div>
+            <div class="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200">
+              <div class="text-[10px] text-emerald-700 font-semibold">Correct</div>
+              <div class="text-base font-extrabold text-emerald-700">${rec.totalCorrect}</div>
+            </div>
+            <div class="p-2.5 rounded-xl bg-indigo-50 border border-indigo-200">
+              <div class="text-[10px] text-indigo-700 font-semibold">Accuracy</div>
+              <div class="text-base font-extrabold text-indigo-700">${rec.accuracyPct}%</div>
+            </div>
+          </div>
+
+          <div class="text-[11px] text-slate-500 flex flex-wrap justify-between gap-2">
+            <span>First Attempted: <strong>${new Date(rec.firstAttemptedAt).toLocaleString()}</strong></span>
+            <span>Last Attempted: <strong>${new Date(rec.lastAttemptedAt).toLocaleString()}</strong></span>
+          </div>
+
+          <div>
+            <div class="text-xs font-extrabold uppercase tracking-wider text-slate-600 mb-2">Chronological Attempt History (${rec.attempts.length} immutable record${rec.attempts.length === 1 ? '' : 's'})</div>
+            <div class="space-y-2 max-h-60 overflow-y-auto pr-1">${timelineHtml}</div>
+          </div>
+
+          <div class="flex flex-wrap gap-2 pt-1">
+            <button type="button" id="btnModalReviseSingleQ" class="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold">Practice This Question</button>
+            <button type="button" id="btnModalAskMgSingleQ" class="px-3.5 py-2 rounded-xl bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold">Ask MAHA GYANI</button>
+          </div>
+        </div>`;
+
+      openModal('Question Attempt History', bodyHtml, () => {
+        document.getElementById('btnModalReviseSingleQ')?.addEventListener('click', () => {
+          closeModal();
+          startQuiz(rec.subjectId, buildQuestionObjectsFromConsolidated([rec]), `Single Question Revision`);
+        });
+        document.getElementById('btnModalAskMgSingleQ')?.addEventListener('click', () => {
+          closeModal();
+          askMahaGyaniAboutQuestion({
+            subjectName: rec.subjectName,
+            chapter: rec.chapter,
+            qNum: 1,
+            question: rec.question,
+            options: rec.options,
+            correctIndex: rec.correctIndex,
+            userSelectedIdx: rec.lastWrongAns
+          });
+        });
+      });
+    }
+
+    function applyConsolidatedFilters(list, f) {
+      const now = Date.now();
+      const q = (f.search || '').trim().toLowerCase();
+      let res = list.filter(item => {
+        if (f.subject !== 'all' && item.subjectId !== f.subject) return false;
+        if (f.chapter !== 'all' && item.chapter !== f.chapter) return false;
+        if (f.difficulty !== 'all' && (item.difficulty || 'medium') !== f.difficulty) return false;
+        if (f.learningStatus !== 'all' && item.learningStatus !== f.learningStatus) return false;
+        if (f.repeatedOnly && !item.isRepeatedMistake) return false;
+        if (f.status === 'wrong' && item.lastIsCorrect) return false;
+        if (f.status === 'correct' && !item.lastIsCorrect) return false;
+        const minW = parseInt(f.minWrong || '0', 10) || 0;
+        if (minW > 0 && item.totalWrong < minW) return false;
+        if (f.sessionId !== 'all' && !item.attempts.some(a => a.sessionId === f.sessionId)) return false;
+        if (f.dateRange !== 'all') {
+          const days = f.dateRange === '7d' ? 7 : f.dateRange === '30d' ? 30 : 90;
+          if ((now - Date.parse(item.lastAttemptedAt)) > days * 86400000) return false;
+        }
+        if (q) {
+          const hay = `${item.question} ${item.chapter} ${item.subjectName} ${(item.options || []).join(' ')}`.toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+
+      if (f.sortBy === 'oldest') {
+        res.sort((a, b) => Date.parse(a.firstAttemptedAt) - Date.parse(b.firstAttemptedAt));
+      } else if (f.sortBy === 'most_wrong') {
+        res.sort((a, b) => (b.totalWrong - a.totalWrong) || (Date.parse(b.lastAttemptedAt) - Date.parse(a.lastAttemptedAt)));
+      } else if (f.sortBy === 'lowest_accuracy') {
+        res.sort((a, b) => (a.accuracyPct - b.accuracyPct) || (b.totalWrong - a.totalWrong));
+      } else {
+        res.sort((a, b) => Date.parse(b.lastAttemptedAt) - Date.parse(a.lastAttemptedAt));
+      }
+      return res;
+    }
+
+    function renderHistoryView() {
+      const f = getHistoryFilters();
+      const allAttempts = AttemptDB.getAttemptsForStudent();
+      const allConsolidated = AttemptDB.getConsolidatedQuestions();
+      const allMistakes = computeMistakeBank();
+      const allSessions = state.sessions || [];
+      const letters = ['A', 'B', 'C', 'D', 'E'];
+      const threshold = AttemptDB.getMasteryThreshold();
+
+      const totalAttempts = allAttempts.length;
+      const uniqueAttempted = allConsolidated.length;
+      const totalCorrectAtt = allAttempts.filter(a => a.isCorrect).length;
+      const totalWrongAtt = allAttempts.filter(a => !a.isCorrect).length;
+      const overallAcc = totalAttempts > 0 ? ((totalCorrectAtt / totalAttempts) * 100).toFixed(1) + '%' : '—';
+
+      const unresolvedMistakes = allMistakes.filter(m => !m.isMastered);
+      const correctedMistakes = allMistakes.filter(m => m.isCorrected);
+      const repeatedMistakes = allMistakes.filter(m => m.isRepeatedMistake);
+      const now = Date.now();
+      const recentMistakes7d = allMistakes.filter(m => (now - Date.parse(m.lastAttemptedAt)) <= 7 * 86400000);
+
+      // Daily, weekly, monthly real activity stats
+      const periodStats = (days) => {
+        const list = allAttempts.filter(a => (now - Date.parse(a.timestamp)) <= days * 86400000);
+        const cor = list.filter(a => a.isCorrect).length;
+        const acc = list.length ? ((cor / list.length) * 100).toFixed(1) + '%' : '—';
+        return { count: list.length, wrong: list.length - cor, acc };
+      };
+      const actDaily = periodStats(1);
+      const actWeekly = periodStats(7);
+      const actMonthly = periodStats(30);
+
+      // Subject-wise & chapter-wise performance from AttemptDB
+      const subjPerfMap = new Map();
+      const chapPerfMap = new Map();
+      allAttempts.forEach(a => {
+        if (!subjPerfMap.has(a.subjectId)) subjPerfMap.set(a.subjectId, { id: a.subjectId, name: a.subjectName, total: 0, correct: 0, wrong: 0 });
+        const sp = subjPerfMap.get(a.subjectId);
+        sp.total++; if (a.isCorrect) sp.correct++; else sp.wrong++;
+
+        const ck = `${a.subjectId}::${a.chapter}`;
+        if (!chapPerfMap.has(ck)) chapPerfMap.set(ck, { subjectId: a.subjectId, subjectName: a.subjectName, chapter: a.chapter, total: 0, correct: 0, wrong: 0 });
+        const cp = chapPerfMap.get(ck);
+        cp.total++; if (a.isCorrect) cp.correct++; else cp.wrong++;
+      });
+      const subjPerf = [...subjPerfMap.values()].map(s => ({ ...s, acc: s.total ? Number(((s.correct / s.total) * 100).toFixed(1)) : 0 })).sort((a, b) => b.wrong - a.wrong);
+      const weakestChapters = [...chapPerfMap.values()].filter(c => c.wrong > 0).map(c => ({ ...c, acc: c.total ? Number(((c.correct / c.total) * 100).toFixed(1)) : 0 })).sort((a, b) => a.acc - b.acc || b.wrong - a.wrong).slice(0, 6);
+
+      const subTab = state.historySubTab || 'mistakes';
+
+      // Available chapters & sessions for filter dropdowns
+      const chapterPool = [...new Set(allConsolidated.filter(q => f.subject === 'all' || q.subjectId === f.subject).map(q => q.chapter))].sort();
+      const sessionOptions = [...new Map(allAttempts.map(a => [a.sessionId, { id: a.sessionId, label: a.sessionLabel || a.sessionId, ts: a.timestamp }])).values()].slice(0, 30);
+
+      const filteredMistakes = applyConsolidatedFilters(allMistakes, f);
+      const filteredSessions = f.subject === 'all' ? allSessions : allSessions.filter(s => s.subjectId === f.subject);
+
+      const lastBackup = AttemptDB.getLastBackupAt();
+      const activeStudentId = getActiveStudentId();
 
       return `
         <div class="space-y-5">
           <!-- Header -->
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h2 class="text-xl font-bold text-slate-900">Past Tests & Mistake Bank</h2>
-              <p class="text-xs text-slate-500 mt-0.5">Review every test you've taken, inspect wrong answers, and re-practice your mistakes until mastered.</p>
+              <h2 class="text-xl font-bold text-slate-900">History, Mistake Bank & Smart Revision</h2>
+              <p class="text-xs text-slate-500 mt-0.5">Permanent IndexedDB attempt history — every attempt is preserved and never erased automatically.</p>
             </div>
-            ${activeFilteredCount > 0 ? `
-              <div class="flex flex-wrap items-center gap-2">
-                <button id="btnExportWrongPdf" class="btn-press px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs sm:text-sm font-semibold flex items-center gap-1.5 shadow-xs" title="Export your wrong questions as a printable PDF">
+            <div class="flex flex-wrap items-center gap-2">
+              ${unresolvedMistakes.length > 0 ? `
+                <button id="btnExportWrongPdf" class="btn-press px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-xs">
                   <i data-lucide="file-down" class="w-4 h-4"></i>
-                  <span>Wrong Qs PDF (${activeFilteredCount})</span>
+                  <span>Wrong Qs PDF (${unresolvedMistakes.length})</span>
                 </button>
-                <button id="btnPracticeAllMistakes" class="btn-press px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs sm:text-sm font-semibold flex items-center gap-1.5 shadow-xs">
+                <button id="btnPracticeAllMistakes" class="btn-press px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-xs">
                   <i data-lucide="rotate-ccw" class="w-4 h-4"></i>
-                  <span>Practice Wrong MCQs (${activeFilteredCount})</span>
+                  <span>Revise Unresolved (${unresolvedMistakes.length})</span>
                 </button>
+              ` : ''}
+            </div>
+          </div>
+
+          <!-- Top Sub-Tabs -->
+          <div class="flex flex-wrap items-center gap-2 border-b border-slate-200 pb-2">
+            <button data-hist-tab="overview" class="px-3.5 py-1.5 rounded-xl text-xs sm:text-sm font-bold transition ${subTab === 'overview' ? 'bg-indigo-600 text-white shadow-xs' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">
+              Overview & Timeline (${totalAttempts})
+            </button>
+            <button data-hist-tab="mistakes" class="px-3.5 py-1.5 rounded-xl text-xs sm:text-sm font-bold transition ${subTab === 'mistakes' ? 'bg-rose-600 text-white shadow-xs' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">
+              Mistake Bank (${allMistakes.length})
+            </button>
+            <button data-hist-tab="tests" class="px-3.5 py-1.5 rounded-xl text-xs sm:text-sm font-bold transition ${subTab === 'tests' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">
+              Past Tests (${allSessions.length})
+            </button>
+            <button data-hist-tab="backup" class="px-3.5 py-1.5 rounded-xl text-xs sm:text-sm font-bold transition ${subTab === 'backup' ? 'bg-emerald-600 text-white shadow-xs' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">
+              Backup & Restore
+            </button>
+          </div>
+
+          ${subTab === 'overview' ? `
+            <!-- OVERVIEW & TIMELINE TAB -->
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div class="bg-white rounded-2xl border border-slate-200 p-4">
+                <div class="text-xs text-slate-500 font-medium">Total Attempts</div>
+                <div class="text-2xl font-extrabold text-slate-900 mt-1">${totalAttempts}</div>
+                <div class="text-[11px] text-slate-400">${uniqueAttempted} unique Qs</div>
               </div>
-            ` : ''}
-          </div>
+              <div class="bg-white rounded-2xl border border-slate-200 p-4">
+                <div class="text-xs text-slate-500 font-medium">Overall Accuracy</div>
+                <div class="text-2xl font-extrabold text-indigo-600 mt-1">${overallAcc}</div>
+                <div class="text-[11px] text-emerald-600 font-semibold">${totalCorrectAtt} correct • ${totalWrongAtt} wrong</div>
+              </div>
+              <div class="bg-white rounded-2xl border border-slate-200 p-4">
+                <div class="text-xs text-slate-500 font-medium">Unresolved Mistakes</div>
+                <div class="text-2xl font-extrabold text-rose-600 mt-1">${unresolvedMistakes.length}</div>
+                <div class="text-[11px] text-slate-500">${repeatedMistakes.length} repeated (2+×)</div>
+              </div>
+              <div class="bg-white rounded-2xl border border-slate-200 p-4">
+                <div class="text-xs text-slate-500 font-medium">Corrected Mistakes</div>
+                <div class="text-2xl font-extrabold text-emerald-600 mt-1">${correctedMistakes.length}</div>
+                <div class="text-[11px] text-slate-500">${allMistakes.filter(m => m.isMastered).length} consistently correct</div>
+              </div>
+            </div>
 
-          <!-- KPI Strip -->
-          <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
-            <div class="bg-white rounded-2xl border border-slate-200 p-4">
-              <div class="text-xs font-medium text-slate-500">Tests Completed</div>
-              <div class="text-2xl font-extrabold text-slate-900 mt-1">${allSessions.length}</div>
+            <!-- Daily / Weekly / Monthly Activity -->
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div class="bg-white rounded-2xl border border-slate-200 p-4">
+                <div class="text-xs font-bold text-indigo-600 uppercase tracking-wider">Today (24h)</div>
+                <div class="text-xl font-extrabold text-slate-900 mt-1">${actDaily.count} attempts</div>
+                <div class="text-xs text-slate-500">Accuracy: <strong>${actDaily.acc}</strong> • ${actDaily.wrong} wrong</div>
+              </div>
+              <div class="bg-white rounded-2xl border border-slate-200 p-4">
+                <div class="text-xs font-bold text-violet-600 uppercase tracking-wider">This Week (7d)</div>
+                <div class="text-xl font-extrabold text-slate-900 mt-1">${actWeekly.count} attempts</div>
+                <div class="text-xs text-slate-500">Accuracy: <strong>${actWeekly.acc}</strong> • ${actWeekly.wrong} wrong</div>
+              </div>
+              <div class="bg-white rounded-2xl border border-slate-200 p-4">
+                <div class="text-xs font-bold text-emerald-600 uppercase tracking-wider">This Month (30d)</div>
+                <div class="text-xl font-extrabold text-slate-900 mt-1">${actMonthly.count} attempts</div>
+                <div class="text-xs text-slate-500">Accuracy: <strong>${actMonthly.acc}</strong> • ${actMonthly.wrong} wrong</div>
+              </div>
             </div>
-            <div class="bg-white rounded-2xl border border-slate-200 p-4">
-              <div class="text-xs font-medium text-slate-500">Total MCQs Attempted</div>
-              <div class="text-2xl font-extrabold text-indigo-600 mt-1">${totalSolved}</div>
-            </div>
-            <div class="bg-white rounded-2xl border border-slate-200 p-4">
-              <div class="text-xs font-medium text-slate-500">Overall Accuracy</div>
-              <div class="text-2xl font-extrabold text-emerald-600 mt-1">${overallAcc}${overallAcc !== '—' ? '%' : ''}</div>
-            </div>
-            <div class="bg-white rounded-2xl border border-slate-200 p-4">
-              <div class="text-xs font-medium text-slate-500">Active Mistakes</div>
-              <div class="text-2xl font-extrabold text-rose-600 mt-1">${activeMistakes.length}</div>
-              <div class="text-[11px] text-slate-400 mt-0.5">${masteredMistakes.length} mastered</div>
-            </div>
-          </div>
 
-          <!-- Sub-tabs + Subject Filter -->
-          <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-2">
-            <div class="flex items-center gap-4">
-              <button data-hist-tab="tests" class="pb-2 text-sm font-semibold border-b-2 transition ${subTab === 'tests' ? 'border-indigo-600 text-indigo-700' : 'border-transparent text-slate-500 hover:text-slate-800'}">
-                Past Tests (${filteredSessions.length})
-              </button>
-              <button data-hist-tab="mistakes" class="pb-2 text-sm font-semibold border-b-2 transition flex items-center gap-1.5 ${subTab === 'mistakes' ? 'border-rose-600 text-rose-700' : 'border-transparent text-slate-500 hover:text-slate-800'}">
-                <span>Mistake Bank</span>
-                <span class="px-1.5 py-0.5 text-[11px] rounded-full ${activeMistakes.length ? 'bg-rose-100 text-rose-700' : 'bg-slate-100 text-slate-600'}">${activeMistakes.length}</span>
-              </button>
-            </div>
-            <div class="flex flex-wrap items-center gap-1.5">
-              <button data-hist-subj="all" class="px-2.5 py-1 rounded-lg text-xs font-semibold border transition ${subjFilter === 'all' ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}">All</button>
-              ${state.subjects.map(s => `
-                <button data-hist-subj="${escapeHtml(s.id)}" class="px-2.5 py-1 rounded-lg text-xs font-semibold border transition ${subjFilter === s.id ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}">${escapeHtml(s.code)}</button>
-              `).join('')}
-            </div>
-          </div>
+            <!-- Subject-wise & Weakest Chapters -->
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div class="bg-white rounded-2xl border border-slate-200 p-4">
+                <h3 class="text-sm font-bold text-slate-900 mb-3">Subject-Wise Performance</h3>
+                ${subjPerf.length ? `
+                  <div class="space-y-2.5">
+                    ${subjPerf.map(s => `
+                      <div>
+                        <div class="flex justify-between text-xs font-semibold mb-1">
+                          <span class="text-slate-800">${escapeHtml(s.name)}</span>
+                          <span class="text-slate-600">${s.acc}% (${s.correct}/${s.total} • ${s.wrong} wrong)</span>
+                        </div>
+                        <div class="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                          <div class="h-full ${s.acc >= 75 ? 'bg-emerald-500' : s.acc >= 50 ? 'bg-amber-500' : 'bg-rose-500'}" style="width:${s.acc}%"></div>
+                        </div>
+                      </div>
+                    `).join('')}
+                  </div>
+                ` : '<p class="text-xs text-slate-500">Attempt questions in Practice to populate subject-wise stats.</p>'}
+              </div>
 
-          ${subTab === 'tests' ? `
-            ${!filteredSessions.length ? `
-              <div class="bg-white rounded-2xl border border-slate-200 p-10 text-center">
-                <div class="w-12 h-12 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center mx-auto mb-3">
-                  <i data-lucide="clipboard-list" class="w-6 h-6"></i>
+              <div class="bg-white rounded-2xl border border-slate-200 p-4">
+                <h3 class="text-sm font-bold text-slate-900 mb-3">Weakest Chapters (Needs Attention)</h3>
+                ${weakestChapters.length ? `
+                  <div class="space-y-2">
+                    ${weakestChapters.map(c => `
+                      <div class="flex items-center justify-between gap-2 p-2 rounded-xl bg-rose-50/60 border border-rose-100 text-xs">
+                        <div class="min-w-0">
+                          <div class="font-bold text-slate-800 truncate">${escapeHtml(c.chapter)}</div>
+                          <div class="text-[11px] text-slate-500">${escapeHtml(c.subjectName)}</div>
+                        </div>
+                        <div class="text-right shrink-0">
+                          <div class="font-extrabold text-rose-700">${c.acc}%</div>
+                          <div class="text-[10px] text-rose-600">${c.wrong} wrong</div>
+                        </div>
+                      </div>
+                    `).join('')}
+                  </div>
+                ` : '<p class="text-xs text-slate-500">No weak chapters recorded yet.</p>'}
+              </div>
+            </div>
+
+            <!-- Chronological Attempt Timeline -->
+            <div class="bg-white rounded-2xl border border-slate-200 p-4">
+              <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+                <h3 class="text-sm font-bold text-slate-900">Recent Attempt Timeline (Latest ${Math.min(50, allAttempts.length)} of ${allAttempts.length})</h3>
+                <span class="text-[11px] text-slate-500">Click any question to view its full attempt history</span>
+              </div>
+              ${allAttempts.length ? `
+                <div class="space-y-2 max-h-[520px] overflow-y-auto pr-1">
+                  ${allAttempts.slice(0, 50).map(a => `
+                    <div class="p-3 rounded-xl border ${a.isCorrect ? 'border-emerald-200 bg-emerald-50/30' : 'border-rose-200 bg-rose-50/30'} flex flex-wrap items-start justify-between gap-2">
+                      <div class="min-w-0 flex-1">
+                        <div class="flex flex-wrap items-center gap-1.5 text-[11px] mb-1">
+                          <span class="font-extrabold px-2 py-0.5 rounded-full ${a.isCorrect ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}">${a.isCorrect ? '✓ Correct' : '✗ Incorrect'}</span>
+                          <span class="font-semibold text-indigo-700">${escapeHtml(a.subjectName)}</span>
+                          <span class="text-slate-400">•</span>
+                          <span class="text-slate-600">${escapeHtml(a.chapter)}</span>
+                          <span class="text-slate-400">•</span>
+                          <span class="text-slate-500">${new Date(a.timestamp).toLocaleString()}</span>
+                        </div>
+                        <div class="text-xs sm:text-sm font-semibold text-slate-900">${escapeHtml(a.questionText)}</div>
+                        <div class="text-[11px] text-slate-600 mt-1 flex flex-wrap gap-3">
+                          <span>Selected: <strong>(${a.selectedIndex !== null ? letters[a.selectedIndex] : '—'})</strong> ${escapeHtml(a.selectedText)}</span>
+                          <span class="text-emerald-700">Correct: <strong>(${letters[a.correctIndex]})</strong> ${escapeHtml(a.correctText)}</span>
+                          ${a.timeTakenSec ? `<span>Time: ${a.timeTakenSec}s</span>` : ''}
+                        </div>
+                      </div>
+                      <button type="button" data-view-q-history="${escapeHtml(a.questionId)}" class="px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 hover:bg-indigo-50 text-indigo-700 text-[11px] font-bold shrink-0">
+                        History →
+                      </button>
+                    </div>
+                  `).join('')}
                 </div>
-                <h3 class="text-base font-bold text-slate-900">No Past Tests Yet</h3>
-                <p class="text-xs text-slate-500 mt-1">Once you submit any chapter or full-subject practice test, it will appear here with full answer review and mistake tracking.</p>
-                <button id="btnHistStartPractice" class="mt-4 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold">Go to Subjects</button>
+              ` : `
+                <div class="text-center py-8 text-xs text-slate-500">
+                  No attempts recorded yet. Start a Practice session to build your permanent learning timeline.
+                </div>
+              `}
+            </div>
+          ` : subTab === 'mistakes' ? `
+            <!-- CONSOLIDATED MISTAKE BANK & SMART REVISION TAB -->
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div class="bg-white rounded-2xl border border-slate-200 p-3.5">
+                <div class="text-[11px] text-slate-500 font-medium">All-Time Wrong Attempts</div>
+                <div class="text-xl font-extrabold text-rose-600 mt-0.5">${totalWrongAtt}</div>
+                <div class="text-[11px] text-slate-400">${allMistakes.length} unique mistake Qs</div>
               </div>
-            ` : `
+              <div class="bg-white rounded-2xl border border-slate-200 p-3.5">
+                <div class="text-[11px] text-slate-500 font-medium">Repeated Mistakes (2+×)</div>
+                <div class="text-xl font-extrabold text-amber-600 mt-0.5">${repeatedMistakes.length}</div>
+                <div class="text-[11px] text-slate-400">${recentMistakes7d.length} made in last 7d</div>
+              </div>
+              <div class="bg-white rounded-2xl border border-slate-200 p-3.5">
+                <div class="text-[11px] text-slate-500 font-medium">Unresolved vs Corrected</div>
+                <div class="text-xl font-extrabold text-slate-900 mt-0.5">${unresolvedMistakes.length} <span class="text-xs font-semibold text-emerald-600">/ ${correctedMistakes.length}</span></div>
+                <div class="text-[11px] text-slate-400">Mastery rule: ${threshold}× consecutive ✓</div>
+              </div>
+              <div class="bg-white rounded-2xl border border-slate-200 p-3.5">
+                <div class="text-[11px] text-slate-500 font-medium">Most Problematic Subject</div>
+                <div class="text-sm font-extrabold text-indigo-700 mt-1 truncate">${subjPerf[0] ? escapeHtml(subjPerf[0].name) : '—'}</div>
+                <div class="text-[11px] text-slate-400">${subjPerf[0] ? `${subjPerf[0].wrong} wrong (${subjPerf[0].acc}%)` : 'No mistakes yet'}</div>
+              </div>
+            </div>
+
+            <!-- Smart Revision Engine Modes -->
+            <div class="bg-gradient-to-r from-indigo-50 via-violet-50 to-rose-50 rounded-2xl border border-indigo-200/80 p-4 space-y-3">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div class="text-xs font-extrabold uppercase tracking-wider text-indigo-700">Smart Revision Engine (7 Modes)</div>
+                  <div class="text-[11px] text-slate-600">Every revision attempt updates learning status without erasing original mistake history.</div>
+                </div>
+                <div class="flex items-center gap-1.5 text-xs">
+                  <label for="selMasteryThreshold" class="font-semibold text-slate-700">Mastery Rule:</label>
+                  <select id="selMasteryThreshold" class="rounded-lg border border-indigo-300 bg-white px-2 py-1 text-xs font-bold text-indigo-800">
+                    ${[2, 3, 4, 5].map(n => `<option value="${n}" ${threshold === n ? 'selected' : ''}>${n}× consecutive ✓</option>`).join('')}
+                  </select>
+                </div>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <button type="button" data-rev-mode="unresolved" class="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold">Unresolved (${unresolvedMistakes.length})</button>
+                <button type="button" data-rev-mode="all_mistakes" class="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold">All Mistakes (${allMistakes.length})</button>
+                <button type="button" data-rev-mode="repeated" class="px-3 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold">Repeated 2+× (${repeatedMistakes.length})</button>
+                <button type="button" data-rev-mode="subject" class="px-3 py-1.5 rounded-xl bg-white hover:bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-bold">Subject-wise</button>
+                <button type="button" data-rev-mode="chapter" class="px-3 py-1.5 rounded-xl bg-white hover:bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-bold">Chapter-wise</button>
+                <button type="button" data-rev-mode="corrected" class="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold">Previously Corrected (${correctedMistakes.length})</button>
+                <button type="button" data-rev-mode="random" class="px-3 py-1.5 rounded-xl bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold">Random Revision</button>
+              </div>
+            </div>
+
+            <!-- Search, Filter & Sort Controls -->
+            <div class="bg-white rounded-2xl border border-slate-200 p-4 space-y-3">
+              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                <input id="inpHistSearch" type="text" value="${escapeHtml(f.search)}" placeholder="Search mistake text, chapter, option..." class="px-3 py-2 rounded-xl border border-slate-300 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                <select id="selHistSubject" class="px-3 py-2 rounded-xl border border-slate-300 text-xs bg-white">
+                  <option value="all">All Subjects</option>
+                  ${state.subjects.map(s => `<option value="${s.id}" ${f.subject === s.id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
+                </select>
+                <select id="selHistChapter" class="px-3 py-2 rounded-xl border border-slate-300 text-xs bg-white">
+                  <option value="all">All Chapters</option>
+                  ${chapterPool.map(c => `<option value="${escapeHtml(c)}" ${f.chapter === c ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+                </select>
+                <select id="selHistLearningStatus" class="px-3 py-2 rounded-xl border border-slate-300 text-xs bg-white">
+                  <option value="all">All Learning Statuses</option>
+                  ${['Not Revised', 'Under Revision', 'Corrected Once', 'Consistently Correct'].map(st => `<option value="${st}" ${f.learningStatus === st ? 'selected' : ''}>${st}</option>`).join('')}
+                </select>
+              </div>
+              <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+                <select id="selHistDateRange" class="px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs bg-white">
+                  <option value="all" ${f.dateRange === 'all' ? 'selected' : ''}>All Dates</option>
+                  <option value="7d" ${f.dateRange === '7d' ? 'selected' : ''}>Last 7 Days</option>
+                  <option value="30d" ${f.dateRange === '30d' ? 'selected' : ''}>Last 30 Days</option>
+                  <option value="90d" ${f.dateRange === '90d' ? 'selected' : ''}>Last 90 Days</option>
+                </select>
+                <select id="selHistDifficulty" class="px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs bg-white">
+                  <option value="all" ${f.difficulty === 'all' ? 'selected' : ''}>All Difficulties</option>
+                  <option value="easy" ${f.difficulty === 'easy' ? 'selected' : ''}>Easy</option>
+                  <option value="medium" ${f.difficulty === 'medium' ? 'selected' : ''}>Medium</option>
+                  <option value="hard" ${f.difficulty === 'hard' ? 'selected' : ''}>Hard</option>
+                  <option value="advanced" ${f.difficulty === 'advanced' ? 'selected' : ''}>Advanced</option>
+                </select>
+                <select id="selHistMinWrong" class="px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs bg-white">
+                  <option value="0" ${f.minWrong === '0' ? 'selected' : ''}>Any Wrong Count</option>
+                  <option value="2" ${f.minWrong === '2' ? 'selected' : ''}>2+ Wrong</option>
+                  <option value="3" ${f.minWrong === '3' ? 'selected' : ''}>3+ Wrong</option>
+                </select>
+                <select id="selHistLastStatus" class="px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs bg-white">
+                  <option value="all" ${f.status === 'all' ? 'selected' : ''}>Last: Any</option>
+                  <option value="wrong" ${f.status === 'wrong' ? 'selected' : ''}>Last: Incorrect</option>
+                  <option value="correct" ${f.status === 'correct' ? 'selected' : ''}>Last: Correct</option>
+                </select>
+                <select id="selHistSession" class="px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs bg-white">
+                  <option value="all">All Sessions</option>
+                  ${sessionOptions.map(so => `<option value="${escapeHtml(so.id)}" ${f.sessionId === so.id ? 'selected' : ''}>${escapeHtml(so.label.slice(0, 28))}</option>`).join('')}
+                </select>
+                <select id="selHistSort" class="px-2.5 py-1.5 rounded-lg border border-indigo-300 text-xs bg-indigo-50/50 font-semibold text-indigo-900">
+                  <option value="newest" ${f.sortBy === 'newest' ? 'selected' : ''}>Sort: Newest</option>
+                  <option value="oldest" ${f.sortBy === 'oldest' ? 'selected' : ''}>Sort: Oldest</option>
+                  <option value="most_wrong" ${f.sortBy === 'most_wrong' ? 'selected' : ''}>Sort: Most Incorrect</option>
+                  <option value="lowest_accuracy" ${f.sortBy === 'lowest_accuracy' ? 'selected' : ''}>Sort: Lowest Accuracy</option>
+                </select>
+              </div>
+              <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <label class="inline-flex items-center gap-1.5 font-semibold text-slate-700 cursor-pointer">
+                  <input id="chkHistRepeated" type="checkbox" ${f.repeatedOnly ? 'checked' : ''} class="rounded border-slate-300 text-indigo-600" />
+                  <span>Repeated Mistakes Only (2+ incorrect attempts)</span>
+                </label>
+                <div class="flex items-center gap-2">
+                  <span class="text-slate-500">Showing <strong>${filteredMistakes.length}</strong> of ${allMistakes.length} mistakes</span>
+                  <button type="button" id="btnResetHistFilters" class="text-indigo-600 hover:underline font-bold">Reset Filters</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Consolidated Mistake Cards -->
+            ${filteredMistakes.length ? `
               <div class="space-y-3">
-                ${filteredSessions.map((sess, idx) => {
-                  const isExpanded = state.expandedSessionId === sess.id;
-                  const accColor = sess.accuracy >= 75 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : sess.accuracy >= 50 ? 'bg-amber-50 text-amber-800 border-amber-200' : 'bg-rose-50 text-rose-700 border-rose-200';
-                  const expFilter = state.expandedSessionFilter || 'all';
-                  const reviewItems = (sess.items || []).filter(it => {
-                    if (expFilter === 'wrong') return it.attempted && !it.isCorrect;
-                    if (expFilter === 'correct') return it.isCorrect;
-                    if (expFilter === 'skipped') return !it.attempted;
-                    return true;
+                ${filteredMistakes.map(m => {
+                  const badgeCls = HIST_STATUS_BADGE[m.learningStatus] || 'bg-slate-100 text-slate-700 border-slate-200';
+                  const isBm = !!state.bookmarks[m.questionId];
+                  const mgKey = registerMgQuestionBtn({
+                    subjectName: m.subjectName,
+                    chapter: m.chapter,
+                    qNum: 1,
+                    question: m.question,
+                    options: m.options,
+                    correctIndex: m.correctIndex,
+                    userSelectedIdx: m.lastWrongAns
                   });
                   return `
-                    <div class="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
-                      <div class="p-4 sm:p-5 flex flex-wrap items-center justify-between gap-3">
-                        <div class="min-w-0 space-y-1">
-                          <div class="flex flex-wrap items-center gap-2">
-                            <span class="text-[11px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700">${escapeHtml(sess.subjectName)}</span>
-                            <span class="text-xs text-slate-400">${new Date(sess.completedAt).toLocaleString()}</span>
-                          </div>
-                          <div class="text-sm sm:text-base font-bold text-slate-900">${escapeHtml(sess.chapterLabel)}</div>
-                          <div class="flex flex-wrap items-center gap-3 text-xs text-slate-600">
-                            <span class="font-semibold text-emerald-700">✓ ${sess.correct} Correct</span>
-                            <span class="font-semibold text-rose-600">✕ ${sess.wrong} Wrong</span>
-                            <span class="text-slate-400">• ${sess.unattempted} Skipped</span>
-                            <span class="text-slate-500">⏱ ${formatClock(sess.totalTimeSec || 0)}</span>
-                          </div>
+                    <div class="bg-white rounded-2xl border border-slate-200 p-4 space-y-2.5 shadow-2xs">
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div class="flex flex-wrap items-center gap-1.5 text-[11px]">
+                          <span class="font-extrabold text-indigo-700">${escapeHtml(m.subjectName)}</span>
+                          <span class="text-slate-300">•</span>
+                          <span class="text-slate-600 font-semibold">${escapeHtml(m.chapter)}</span>
+                          <span class="px-2 py-0.5 rounded-full font-bold bg-rose-100 text-rose-700">Missed ${m.totalWrong}× / ${m.totalAttempts} tries</span>
+                          <span class="px-2 py-0.5 rounded-full font-bold border ${badgeCls}">${escapeHtml(m.learningStatus)} (${m.consecutiveCorrect}/${threshold})</span>
+                          <span class="px-2 py-0.5 rounded-full font-semibold bg-slate-100 text-slate-600">${m.accuracyPct}% acc</span>
                         </div>
-                        <div class="flex flex-wrap items-center gap-2">
-                          <span class="px-2.5 py-1 rounded-xl border text-xs font-bold ${accColor}">${sess.accuracy}% Acc</span>
-                          <button data-expand-sess="${escapeHtml(sess.id)}" class="px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-700">
-                            ${isExpanded ? 'Hide Review ▲' : 'Review Answers ▼'}
-                          </button>
-                          ${sess.wrong > 0 ? `
-                            <button data-retry-wrong-sess="${escapeHtml(sess.id)}" class="px-3 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200 text-xs font-semibold text-rose-700">
-                              Retry Wrong (${sess.wrong})
-                            </button>
-                          ` : ''}
-                          <button data-open-analytics-sess="${escapeHtml(sess.id)}" class="px-3 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-xs font-semibold text-indigo-700">
-                            Analytics →
+                        <div class="flex items-center gap-1.5">
+                          <button type="button" data-view-q-history="${escapeHtml(m.questionId)}" class="px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold">Attempt History (${m.totalAttempts})</button>
+                          <button type="button" data-ask-mg-key="${mgKey}" class="px-2.5 py-1 rounded-lg bg-violet-50 hover:bg-violet-100 text-violet-700 text-[11px] font-bold">Ask MAHA GYANI</button>
+                          <button type="button" data-bookmark-mistake="${escapeHtml(m.questionId)}" class="p-1.5 rounded-lg border ${isBm ? 'bg-amber-50 border-amber-300 text-amber-600' : 'border-slate-200 text-slate-400 hover:text-amber-600'}" title="Bookmark">
+                            <i data-lucide="bookmark" class="w-3.5 h-3.5"></i>
                           </button>
                         </div>
                       </div>
-
-                      ${isExpanded ? `
-                        <div class="border-t border-slate-100 bg-slate-50/70 p-4 sm:p-5 space-y-3">
-                          <div class="flex flex-wrap items-center justify-between gap-2">
-                            <div class="flex flex-wrap items-center gap-1.5">
-                              <button data-sess-filter="all" class="px-2.5 py-1 rounded-lg text-xs font-semibold border ${expFilter === 'all' ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200'}">All (${sess.total})</button>
-                              <button data-sess-filter="wrong" class="px-2.5 py-1 rounded-lg text-xs font-semibold border ${expFilter === 'wrong' ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-rose-700 border-rose-200'}">Wrong (${sess.wrong})</button>
-                              <button data-sess-filter="correct" class="px-2.5 py-1 rounded-lg text-xs font-semibold border ${expFilter === 'correct' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-emerald-700 border-emerald-200'}">Correct (${sess.correct})</button>
-                              <button data-sess-filter="skipped" class="px-2.5 py-1 rounded-lg text-xs font-semibold border ${expFilter === 'skipped' ? 'bg-slate-700 text-white border-slate-700' : 'bg-white text-slate-600 border-slate-200'}">Skipped (${sess.unattempted})</button>
-                            </div>
-                          </div>
-                          ${!reviewItems.length ? `<p class="text-xs text-slate-500 py-2">No questions match this filter.</p>` : `
-                            <div class="space-y-2.5 max-h-[540px] overflow-y-auto pr-1">
-                              ${reviewItems.map(it => {
-                                const statusBadge = it.isCorrect
-                                  ? '<span class="px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800 text-[11px] font-bold">Correct</span>'
-                                  : it.attempted
-                                    ? '<span class="px-2 py-0.5 rounded-md bg-rose-100 text-rose-800 text-[11px] font-bold">Wrong</span>'
-                                    : '<span class="px-2 py-0.5 rounded-md bg-slate-200 text-slate-700 text-[11px] font-bold">Skipped</span>';
-                                return `
-                                  <div class="bg-white rounded-xl border ${it.isCorrect ? 'border-emerald-200/80' : it.attempted ? 'border-rose-200' : 'border-slate-200'} p-3.5 space-y-2">
-                                    <div class="flex flex-wrap items-center justify-between gap-2">
-                                      <div class="flex items-center gap-2">
-                                        <span class="text-xs font-bold text-slate-900">Q${it.qNum}</span>
-                                        ${statusBadge}
-                                        <span class="text-[11px] text-slate-400">⏱ ${it.actualSec}s</span>
-                                      </div>
-                                      <div class="flex items-center gap-2">
-                                        <span class="text-[11px] text-slate-400">${escapeHtml(it.chapter || '')}</span>
-                                        <button type="button" data-ask-mg-key="${registerMgQuestionBtn({ qNum: it.qNum, total: sess.total, subjectName: sess.subjectName, chapter: it.chapter || sess.chapterLabel, question: it.question, options: it.options, userAns: it.userAns, correctIndex: it.correctIndex, sourcePdf: it.sourcePdf })}" class="inline-flex items-center gap-1 pl-1 pr-2 py-0.5 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold transition">
-                                          <img src="${MG_AVATAR_URI}" alt="MAHA GYANI" class="w-4 h-4 rounded-full object-cover" />
-                                          <span>Ask MAHA GYANI</span>
-                                        </button>
-                                      </div>
-                                    </div>
-                                    <p class="text-sm font-medium text-slate-900 leading-snug">${escapeHtml(it.question)}</p>
-                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
-                                      ${it.attempted && !it.isCorrect ? `
-                                        <div class="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-rose-800">
-                                          <span class="font-bold">Your Answer (${letters[it.userAns] || ''}):</span> ${escapeHtml((it.options || [])[it.userAns] || '')}
-                                        </div>
-                                      ` : ''}
-                                      <div class="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 ${it.isCorrect || !it.attempted ? 'sm:col-span-2' : ''}">
-                                        <span class="font-bold">Correct Answer (${letters[it.correctIndex] || ''}):</span> ${escapeHtml((it.options || [])[it.correctIndex] || '')}
-                                      </div>
-                                    </div>
-                                  </div>
-                                `;
-                              }).join('')}
-                            </div>
-                          `}
+                      <div class="text-sm font-bold text-slate-900 leading-snug">${escapeHtml(m.question)}</div>
+                      <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                        <div class="px-3 py-2 rounded-xl bg-rose-50 border border-rose-200 text-rose-900">
+                          <span class="font-bold text-rose-700">Last Wrong Choice (${m.lastWrongAns !== null ? letters[m.lastWrongAns] : '—'}):</span>
+                          ${escapeHtml(m.lastWrongAns !== null && m.options[m.lastWrongAns] ? m.options[m.lastWrongAns] : '—')}
                         </div>
-                      ` : ''}
-                    </div>
-                  `;
+                        <div class="px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900">
+                          <span class="font-bold text-emerald-700">Correct Answer (${letters[m.correctIndex]}):</span>
+                          ${escapeHtml(m.options[m.correctIndex] || '—')}
+                        </div>
+                      </div>
+                    </div>`;
                 }).join('')}
               </div>
-            `}
-          ` : `
-            <!-- Mistake Bank Tab -->
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <div class="flex flex-wrap items-center gap-1.5">
-                <button data-mistake-status="active" class="px-3 py-1.5 rounded-xl text-xs font-semibold border ${mStatus === 'active' ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-slate-600 border-slate-200'}">Needs Practice (${activeMistakes.length})</button>
-                <button data-mistake-status="mastered" class="px-3 py-1.5 rounded-xl text-xs font-semibold border ${mStatus === 'mastered' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-600 border-slate-200'}">Mastered (${masteredMistakes.length})</button>
-                <button data-mistake-status="all" class="px-3 py-1.5 rounded-xl text-xs font-semibold border ${mStatus === 'all' ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200'}">All Ever Missed (${mistakes.length})</button>
-              </div>
-              <span class="text-xs text-slate-500">Answer a mistake correctly in any future test to automatically mark it <strong>Mastered</strong>.</span>
-            </div>
-
-            ${!filteredMistakes.length ? `
-              <div class="bg-white rounded-2xl border border-slate-200 p-10 text-center">
-                <div class="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto mb-3">
-                  <i data-lucide="check-circle-2" class="w-6 h-6"></i>
-                </div>
-                <h3 class="text-base font-bold text-slate-900">${mStatus === 'active' ? 'Zero Active Mistakes!' : 'No Mistakes Recorded Here'}</h3>
-                <p class="text-xs text-slate-500 mt-1">${mStatus === 'active' ? 'Great job—every wrong question you had is mastered (or you haven\'t missed any yet).' : 'Complete practice sessions to track and drill your weak MCQs.'}</p>
-              </div>
             ` : `
-              <div class="space-y-3">
-                ${filteredMistakes.map(m => `
-                  <div class="bg-white rounded-2xl border ${m.isMastered ? 'border-emerald-200' : 'border-rose-200/80'} p-4 sm:p-5 space-y-3 shadow-xs">
-                    <div class="flex flex-wrap items-center justify-between gap-2">
-                      <div class="flex flex-wrap items-center gap-1.5">
-                        <span class="text-[11px] font-bold uppercase px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700">${escapeHtml(m.subjectName)}</span>
-                        <span class="text-[11px] font-medium px-2 py-0.5 rounded-md bg-slate-100 text-slate-700">${escapeHtml(m.chapter)}</span>
-                        <span class="text-[11px] font-bold px-2 py-0.5 rounded-md bg-rose-100 text-rose-700">Missed ${m.timesWrong}×</span>
-                        ${m.isMastered ? '<span class="text-[11px] font-bold px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-700">Mastered ✓</span>' : ''}
-                      </div>
-                      <div class="flex items-center gap-1.5">
-                        <button type="button" data-ask-mg-key="${registerMgQuestionBtn({ subjectName: m.subjectName, chapter: m.chapter, question: m.question, options: m.options, userAns: m.lastWrongAns, correctIndex: m.correctIndex, sourcePdf: m.sourcePdf })}" class="inline-flex items-center gap-1.5 pl-1 pr-2.5 py-1 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold transition">
-                          <img src="${MG_AVATAR_URI}" alt="MAHA GYANI" class="w-4 h-4 rounded-full object-cover" />
-                          <span>Ask MAHA GYANI</span>
-                        </button>
-                        <button data-bookmark-mistake="${escapeHtml(m.id || '')}" class="p-1.5 rounded-lg border ${state.bookmarks[m.id] ? 'bg-amber-50 border-amber-300 text-amber-600' : 'border-slate-200 text-slate-400 hover:text-slate-700'}" title="Bookmark for Revision">
-                          <i data-lucide="bookmark" class="w-3.5 h-3.5"></i>
-                        </button>
-                      </div>
+              <div class="bg-white rounded-2xl border border-slate-200 p-8 text-center">
+                <p class="text-sm font-semibold text-slate-700">${allMistakes.length ? 'No mistakes match your current filters.' : 'No mistakes recorded yet — start practicing to populate your Mistake Bank!'}</p>
+                ${!allMistakes.length ? '<button id="btnHistStartPractice" class="mt-3 px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-bold">Start Practice</button>' : ''}
+              </div>
+            `}
+          ` : subTab === 'tests' ? `
+            <!-- PAST TESTS TAB -->
+            ${filteredSessions.length ? `
+              <div class="space-y-2.5">
+                ${filteredSessions.map(s => `
+                  <div class="bg-white rounded-2xl border border-slate-200 p-4 flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div class="text-xs font-bold text-indigo-600">${escapeHtml(s.subjectName)}</div>
+                      <div class="text-sm font-extrabold text-slate-900">${escapeHtml(s.chapterLabel)}</div>
+                      <div class="text-[11px] text-slate-500 mt-0.5">${new Date(s.completedAt).toLocaleString()} • ${s.correct}✓ / ${s.wrong}✗ / ${s.unattempted || 0} skipped</div>
                     </div>
-                    <p class="text-sm sm:text-base font-medium text-slate-900 leading-relaxed">${escapeHtml(m.question)}</p>
-                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
-                      <div class="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800">
-                        <div class="font-bold mb-0.5">Your Last Wrong Choice (${letters[m.lastWrongAns] || ''})</div>
-                        <div>${escapeHtml((m.options || [])[m.lastWrongAns] || '—')}</div>
+                    <div class="flex items-center gap-3">
+                      <div class="text-right">
+                        <div class="text-lg font-extrabold ${s.accuracy >= 75 ? 'text-emerald-600' : s.accuracy >= 50 ? 'text-amber-600' : 'text-rose-600'}">${s.accuracy}%</div>
+                        <div class="text-[10px] text-slate-400">${s.totalTimeSec || 0}s total</div>
                       </div>
-                      <div class="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800">
-                        <div class="font-bold mb-0.5">Correct Answer (${letters[m.correctIndex] || ''})</div>
-                        <div>${escapeHtml((m.options || [])[m.correctIndex] || '—')}</div>
-                      </div>
+                      <button type="button" data-open-sess="${escapeHtml(s.id)}" data-open-subj="${escapeHtml(s.subjectId)}" class="px-3 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold">Inspect →</button>
                     </div>
                   </div>
                 `).join('')}
               </div>
-            `}
+            ` : '<div class="bg-white rounded-2xl border border-slate-200 p-8 text-center text-xs text-slate-500">No completed tests yet.</div>'}
+          ` : `
+            <!-- BACKUP & RESTORE TAB -->
+            <div class="space-y-4">
+              <div class="bg-white rounded-2xl border border-slate-200 p-5 space-y-3">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 class="text-base font-extrabold text-slate-900">Permanent Local Storage & Backup</h3>
+                    <p class="text-xs text-slate-500 mt-0.5">Storage engine: <strong>${AttemptDB._storageMode === 'indexeddb' ? 'IndexedDB (Primary) + Local Mirror' : 'LocalStorage Fallback'}</strong> • Records for active profile: <strong>${totalAttempts}</strong></p>
+                  </div>
+                  <div class="text-xs px-3 py-1.5 rounded-xl bg-slate-100 text-slate-700 font-semibold">
+                    Last Backup: <strong>${lastBackup ? new Date(lastBackup).toLocaleString() : 'Never'}</strong>
+                  </div>
+                </div>
+                <div class="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-2.5">
+                  <strong>Important:</strong> Your history is stored permanently in this browser's IndexedDB and is never cleared by refreshes, tests, or updates. Because this is a static GitHub Pages app, local browser storage does <strong>not</strong> automatically sync across different devices—download a JSON backup to transfer or safeguard your records.
+                </div>
+                <div class="flex flex-wrap gap-2.5 pt-1">
+                  <button type="button" id="btnExportCompleteJson" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center gap-1.5">
+                    <i data-lucide="download" class="w-4 h-4"></i>
+                    <span>Download Complete Backup (JSON)</span>
+                  </button>
+                  <button type="button" id="btnExportMistakesJson" class="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center gap-1.5">
+                    <i data-lucide="file-json" class="w-4 h-4"></i>
+                    <span>Export Mistakes Only (JSON)</span>
+                  </button>
+                  <button type="button" id="btnExportHistoryCsv" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5">
+                    <i data-lucide="table" class="w-4 h-4"></i>
+                    <span>Export Records (CSV)</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="bg-white rounded-2xl border border-slate-200 p-5 space-y-3">
+                <h3 class="text-base font-extrabold text-slate-900">Restore & Merge Backup</h3>
+                <p class="text-xs text-slate-500">Importing a backup <strong>merges</strong> records with your existing history and automatically skips duplicate attempts—your existing records are never overwritten or deleted.</p>
+                <div class="flex flex-wrap items-center gap-3">
+                  <input id="inpRestoreBackupFile" type="file" accept=".json,application/json" class="text-xs file:mr-3 file:py-2 file:px-3.5 file:rounded-xl file:border-0 file:bg-indigo-50 file:text-indigo-700 file:font-bold hover:file:bg-indigo-100" />
+                  <span id="restoreBackupStatus" class="text-xs font-semibold text-emerald-700"></span>
+                </div>
+              </div>
+
+              <div class="bg-white rounded-2xl border border-slate-200 p-5 space-y-3">
+                <h3 class="text-base font-extrabold text-slate-900">Student Profile Isolation</h3>
+                <p class="text-xs text-slate-500">Active Profile ID: <code class="px-1.5 py-0.5 rounded bg-slate-100 text-indigo-700 font-bold">${escapeHtml(activeStudentId)}</code>. Each student profile has strictly isolated attempt history & mistakes on shared devices.</p>
+                <div class="flex flex-wrap items-center gap-2">
+                  <input id="inpSwitchStudentId" type="text" placeholder="Enter another student ID (e.g. stu_rahul)" class="px-3 py-2 rounded-xl border border-slate-300 text-xs w-64" />
+                  <button type="button" id="btnSwitchStudentProfile" class="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold">Switch Profile</button>
+                </div>
+              </div>
+            </div>
           `}
         </div>
       `;
     }
 
     function bindHistoryEvents() {
+      const f = getHistoryFilters();
       document.querySelectorAll('[data-hist-tab]').forEach(btn => {
         btn.addEventListener('click', () => {
           state.historySubTab = btn.dataset.histTab;
           render();
         });
       });
-      document.querySelectorAll('[data-hist-subj]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          state.historySubjectFilter = btn.dataset.histSubj;
-          render();
-        });
-      });
-      document.querySelectorAll('[data-mistake-status]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          state.mistakeStatusFilter = btn.dataset.mistakeStatus;
-          render();
-        });
-      });
-      document.querySelectorAll('[data-expand-sess]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const sid = btn.dataset.expandSess;
-          state.expandedSessionId = state.expandedSessionId === sid ? null : sid;
-          state.expandedSessionFilter = 'all';
-          render();
-        });
-      });
-      document.querySelectorAll('[data-sess-filter]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          state.expandedSessionFilter = btn.dataset.sessFilter;
-          render();
-        });
-      });
-      document.querySelectorAll('[data-open-analytics-sess]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const sess = state.sessions.find(s => s.id === btn.dataset.openAnalyticsSess);
-          if (!sess) return;
-          state.activeSubjectId = sess.subjectId;
-          state.selectedSessionId = sess.id;
-          state.activeNav = 'analytics';
-          state.analyticsSubTab = 'summary';
-          render();
-        });
-      });
-      document.querySelectorAll('[data-retry-wrong-sess]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const sess = state.sessions.find(s => s.id === btn.dataset.retryWrongSess);
-          if (!sess) return;
-          const wrongItems = (sess.items || []).filter(it => it.attempted && !it.isCorrect);
-          if (!wrongItems.length) return;
-          const subj = state.subjects.find(s => s.id === sess.subjectId);
-          const qs = wrongItems.map(it => {
-            const live = subj ? subj.questions.find(q => q.id === it.id) : null;
-            return live || {
-              id: it.id,
-              chapter: it.chapter,
-              topic: it.topic || 'Mistake Review',
-              question: it.question,
-              options: it.options,
-              correctIndex: it.correctIndex,
-              type: it.type || 'mcq',
-              difficulty: it.difficulty || 'medium',
-              sourcePdf: it.sourcePdf || '',
-              sourcePage: it.sourcePage || '',
-              originalQNum: it.originalQNum || ''
-            };
-          });
-          startQuiz(sess.subjectId, qs, `Retry Wrong — ${sess.chapterLabel}`);
-        });
-      });
       document.getElementById('btnExportWrongPdf')?.addEventListener('click', () => {
-        const subjFilter = state.historySubjectFilter || 'all';
-        generateWrongQuestionsPdf({ scope: 'active', subjectId: subjFilter === 'all' ? null : subjFilter });
+        generateWrongQuestionsPdf({ scope: 'active', subjectId: f.subject === 'all' ? null : f.subject });
       });
-      const btnPracticeAll = document.getElementById('btnPracticeAllMistakes');
-      if (btnPracticeAll) {
-        btnPracticeAll.addEventListener('click', () => {
-          const subjFilter = state.historySubjectFilter || 'all';
-          const active = computeMistakeBank().filter(m => !m.isMastered && (subjFilter === 'all' || m.subjectId === subjFilter));
-          if (!active.length) return;
-          const targetSubjId = subjFilter !== 'all' ? subjFilter : active[0].subjectId;
-          const qs = active.map(m => {
-            const subj = state.subjects.find(s => s.id === m.subjectId);
-            const live = subj ? subj.questions.find(q => q.id === m.id) : null;
-            return live || {
-              id: m.id,
-              chapter: m.chapter,
-              topic: 'Mistake Bank',
-              question: m.question,
-              options: m.options,
-              correctIndex: m.correctIndex,
-              type: 'mcq',
-              difficulty: 'medium',
-              sourcePdf: m.sourcePdf || '',
-              sourcePage: m.sourcePage || '',
-              originalQNum: m.originalQNum || ''
-            };
-          });
-          const label = subjFilter === 'all' ? 'Mistake Bank (All Subjects)' : `Mistake Bank (${(state.subjects.find(s => s.id === subjFilter) || {}).code || subjFilter})`;
-          startQuiz(targetSubjId, qs, label);
+      document.getElementById('btnPracticeAllMistakes')?.addEventListener('click', () => {
+        launchSmartRevisionMode('unresolved');
+      });
+      document.querySelectorAll('[data-rev-mode]').forEach(btn => {
+        btn.addEventListener('click', () => launchSmartRevisionMode(btn.dataset.revMode));
+      });
+      document.getElementById('selMasteryThreshold')?.addEventListener('change', (e) => {
+        AttemptDB.setMasteryThreshold(e.target.value);
+        updateNavMistakeBadge();
+        render();
+      });
+
+      // Search & Filter controls
+      const inpSearch = document.getElementById('inpHistSearch');
+      if (inpSearch) {
+        inpSearch.addEventListener('input', (e) => {
+          f.search = e.target.value;
+          const pos = e.target.selectionStart;
+          render();
+          const refreshed = document.getElementById('inpHistSearch');
+          if (refreshed) { refreshed.focus(); try { refreshed.setSelectionRange(pos, pos); } catch (_) {} }
         });
       }
+      const bindSel = (id, key, resetChapter = false) => {
+        document.getElementById(id)?.addEventListener('change', (e) => {
+          f[key] = e.target.value;
+          if (resetChapter) f.chapter = 'all';
+          if (key === 'subject') state.historySubjectFilter = e.target.value;
+          render();
+        });
+      };
+      bindSel('selHistSubject', 'subject', true);
+      bindSel('selHistChapter', 'chapter');
+      bindSel('selHistLearningStatus', 'learningStatus');
+      bindSel('selHistDateRange', 'dateRange');
+      bindSel('selHistDifficulty', 'difficulty');
+      bindSel('selHistMinWrong', 'minWrong');
+      bindSel('selHistLastStatus', 'status');
+      bindSel('selHistSession', 'sessionId');
+      bindSel('selHistSort', 'sortBy');
+
+      document.getElementById('chkHistRepeated')?.addEventListener('change', (e) => {
+        f.repeatedOnly = !!e.target.checked;
+        render();
+      });
+      document.getElementById('btnResetHistFilters')?.addEventListener('click', () => {
+        state.histFilters = null;
+        state.historySubjectFilter = 'all';
+        render();
+      });
+
+      // Per-question history modal & bookmarks
+      document.querySelectorAll('[data-view-q-history]').forEach(btn => {
+        btn.addEventListener('click', () => openQuestionHistoryModal(btn.dataset.viewQHistory));
+      });
       document.querySelectorAll('[data-bookmark-mistake]').forEach(btn => {
         btn.addEventListener('click', () => {
           const qid = btn.dataset.bookmarkMistake;
@@ -39514,16 +40458,57 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
           render();
         });
       });
-      const btnStart = document.getElementById('btnHistStartPractice');
-      if (btnStart) {
-        btnStart.addEventListener('click', () => {
-          state.activeNav = 'subjects';
+
+      // Past Tests open
+      document.querySelectorAll('[data-open-sess]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          state.selectedSessionId = btn.dataset.openSess;
+          if (btn.dataset.openSubj) state.activeSubjectId = btn.dataset.openSubj;
+          state.activeNav = 'analytics';
           render();
         });
-      }
+      });
+
+      // Backup & Restore controls
+      document.getElementById('btnExportCompleteJson')?.addEventListener('click', () => downloadAttemptBackupJson(false));
+      document.getElementById('btnExportMistakesJson')?.addEventListener('click', () => downloadAttemptBackupJson(true));
+      document.getElementById('btnExportHistoryCsv')?.addEventListener('click', () => downloadAttemptBackupCsv(false));
+      document.getElementById('inpRestoreBackupFile')?.addEventListener('change', (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const res = AttemptDB.mergeImportPayload(reader.result);
+            const msg = `Merged ${res.imported} new attempt(s); skipped ${res.duplicates} duplicate(s).`;
+            if (typeof showToast === 'function') showToast(msg, 'success');
+            updateNavMistakeBadge();
+            render();
+            const stEl = document.getElementById('restoreBackupStatus');
+            if (stEl) stEl.textContent = msg;
+          } catch (err) {
+            if (typeof showToast === 'function') showToast(`Restore failed: ${err.message}`, 'error');
+          }
+        };
+        reader.readAsText(file);
+      });
+      document.getElementById('btnSwitchStudentProfile')?.addEventListener('click', () => {
+        const inp = document.getElementById('inpSwitchStudentId');
+        const val = (inp ? inp.value : '').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_');
+        if (!val) return;
+        state.userProfile.studentId = val;
+        saveState();
+        updateNavMistakeBadge();
+        if (typeof showToast === 'function') showToast(`Switched to isolated profile: ${val}`, 'info');
+        render();
+      });
+
+      document.getElementById('btnHistStartPractice')?.addEventListener('click', () => {
+        state.activeNav = 'subjects';
+        render();
+      });
     }
 
-    
     // =========================================================================
     // PHASE 4 & 5: PROFILE, HEATMAP, WEAKNESS DETECTOR, PERIOD COMPARISON, PDF REPORT (FEATURES 23-30)
     // =========================================================================
@@ -39626,6 +40611,125 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
         .replace(/\\/g, '\\\\')
         .replace(/\(/g, '\\(')
         .replace(/\)/g, '\\)');
+    }
+
+    // =========================================================================
+    // MAHA GYANI VERDICT CACHE & LIVE PDF VERIFIER
+    // =========================================================================
+    const MG_VERDICT_CACHE_KEY = 'mcq_conq_mg_verdicts_v1';
+    const MgVerdictStore = {
+      _map: null,
+      _load() {
+        if (this._map) return this._map;
+        this._map = {};
+        try {
+          const raw = localStorage.getItem(MG_VERDICT_CACHE_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object') this._map = parsed;
+          }
+        } catch (_) {}
+        return this._map;
+      },
+      _save() {
+        try {
+          localStorage.setItem(MG_VERDICT_CACHE_KEY, JSON.stringify(this._load()));
+        } catch (_) {}
+      },
+      get(questionId) {
+        if (!questionId) return null;
+        return this._load()[questionId] || null;
+      },
+      set(questionId, verdict) {
+        if (!questionId || !verdict) return;
+        const m = this._load();
+        m[questionId] = { ...verdict, updatedAt: new Date().toISOString() };
+        this._save();
+      },
+      parseFromReply(replyText) {
+        const raw = String(replyText || '').replace(/\r\n/g, '\n');
+        const cleanText = (typeof cleanInlineLatex === 'function' ? cleanInlineLatex(raw) : raw)
+          .replace(/\*\*([^*]+)\*\*/g, '$1')
+          .replace(/__([^_]+)__/g, '$1');
+        const lines = cleanText.split('\n').map(l => l.trim());
+
+        let directAnswer = '';
+        let crux = '';
+        for (let i = 0; i < lines.length; i++) {
+          const l = lines[i];
+          const dm = l.match(/^(?:#{1,4}\s*)?(?:DIRECT\s+ANSWER|CORRECT\s+OPTION|CORRECT\s+ANSWER)\s*[:\-]?\s*(.*)$/i);
+          if (dm && !directAnswer) {
+            directAnswer = (dm[1] || '').trim();
+            if (!directAnswer && i + 1 < lines.length && lines[i + 1]) directAnswer = lines[i + 1].trim();
+          }
+          const cm = l.match(/^(?:#{1,4}\s*)?ULTIMATE\s+CRUX\s*[:\-]?\s*(.*)$/i);
+          if (cm && !crux) {
+            crux = (cm[1] || '').trim();
+            if (!crux && i + 1 < lines.length && lines[i + 1]) crux = lines[i + 1].trim();
+          }
+        }
+        if (!directAnswer) {
+          const firstNonEmpty = lines.find(l => l.length > 4) || '';
+          directAnswer = firstNonEmpty.slice(0, 180);
+        }
+        const isKeyDiscrepancy = /key\s+discrepancy|stored\s+key\s+is\s+(?:wrong|incorrect)/i.test(cleanText);
+        return {
+          finalAnswer: directAnswer.slice(0, 220),
+          crux: crux.slice(0, 280),
+          isKeyDiscrepancy,
+          source: 'ai'
+        };
+      }
+    };
+
+    function getMgVerdictDisplay(item) {
+      const letters = ['A', 'B', 'C', 'D', 'E'];
+      const cached = MgVerdictStore.get(item.key || item.id || item.questionId);
+      if (cached && cached.finalAnswer) {
+        return {
+          isAiVerified: true,
+          isKeyDiscrepancy: !!cached.isKeyDiscrepancy,
+          finalAnswer: cached.finalAnswer,
+          crux: cached.crux || ''
+        };
+      }
+      const cLet = letters[item.correctIndex] || '?';
+      const cText = (item.options && item.options[item.correctIndex]) ? item.options[item.correctIndex] : '';
+      return {
+        isAiVerified: false,
+        isKeyDiscrepancy: false,
+        finalAnswer: `Option (${cLet})${cText ? ' - ' + cText : ''}`,
+        crux: item.explanation || ''
+      };
+    }
+
+    async function verifyWrongItemsWithMahaGyani(items, onProgress) {
+      if (typeof hasLiveAiConfigured !== 'function' || !hasLiveAiConfigured()) {
+        return { ok: false, reason: 'no_ai' };
+      }
+      const letters = ['A', 'B', 'C', 'D', 'E'];
+      const pending = items.filter(it => !MgVerdictStore.get(it.key || it.id || it.questionId));
+      let verified = 0;
+      let failed = 0;
+      for (let i = 0; i < pending.length; i++) {
+        const it = pending[i];
+        if (typeof onProgress === 'function') onProgress(i + 1, pending.length);
+        const optsStr = (it.options || []).map((o, idx) => `(${letters[idx] || idx + 1}) ${o}`).join('\n');
+        const prompt = `Independently verify this CMA Intermediate MCQ and give ONLY:\nDIRECT ANSWER: Option (letter) - exact text (add "Key Discrepancy:" if stored key is wrong)\nULTIMATE CRUX: 1 concise sentence explaining why.\n\nSubject: ${it.subjectName} (${it.chapter})\nQuestion: ${it.question}\nOptions:\n${optsStr}\nStored Reference Key: Option ${letters[it.correctIndex] || '?'}`;
+        try {
+          const reply = await callLiveAiEngine(prompt, {
+            view: 'history',
+            subjectName: it.subjectName,
+            mcq: null
+          });
+          const parsed = MgVerdictStore.parseFromReply(reply);
+          MgVerdictStore.set(it.key || it.id || it.questionId, parsed);
+          verified++;
+        } catch (_) {
+          failed++;
+        }
+      }
+      return { ok: true, verified, failed, totalPending: pending.length };
     }
 
     class McqPdfWriter {
@@ -39732,14 +40836,20 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
           return { lines, isCorrect, isWrong };
         });
 
-        const explLines = item.explanation ? this.wrapText(`Note: ${item.explanation}`, innerW - 8, 8.8) : [];
+        const mgV = getMgVerdictDisplay(item);
+        const mgLabel = mgV.isAiVerified
+          ? (mgV.isKeyDiscrepancy ? 'MAHA GYANI VERDICT [KEY DISCREPANCY - AI VERIFIED]: ' : 'MAHA GYANI FINAL VERDICT (AI VERIFIED): ')
+          : 'MAHA GYANI FINAL ANSWER (BANK KEY): ';
+        const mgAnsLines = this.wrapText(mgLabel + mgV.finalAnswer, innerW - 12, 9.0);
+        const mgCruxLines = mgV.crux ? this.wrapText('Crux: ' + mgV.crux, innerW - 12, 8.5) : [];
+        const mgBoxH = mgAnsLines.length * 12 + (mgCruxLines.length ? mgCruxLines.length * 11.5 + 3 : 0) + 10;
         const cardH =
           18 + // chapter meta line
           qLines.length * 14.5 + 6 +
           optBlocks.reduce((acc, b) => acc + b.lines.length * 13 + 6, 0) +
           16 + // answer summary line
-          (explLines.length ? explLines.length * 12 + 8 : 0) +
-          10;
+          mgBoxH + 8 +
+          8;
 
         this.ensureSpace(Math.min(cardH + 10, 420));
         const topY = this.y;
@@ -39777,10 +40887,21 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
         this.drawTextLine(`Your Choice: ${wLet}   |   Correct Answer: ${cLet}`, this.margin + padX, cy - 2, { font: 'F2', size: 9, rgb: [0.18, 0.23, 0.32] });
         cy -= 15;
 
-        if (explLines.length) {
-          for (const el of explLines) {
-            this.drawTextLine(el, this.margin + padX + 4, cy, { font: 'F1', size: 8.8, rgb: [0.25, 0.24, 0.55] });
-            cy -= 12;
+        // MAHA GYANI Verdict Callout Box inside PDF card
+        const vFill = mgV.isKeyDiscrepancy ? [1.0, 0.97, 0.90] : [0.95, 0.94, 1.0];
+        const vStroke = mgV.isKeyDiscrepancy ? [0.85, 0.47, 0.02] : [0.42, 0.35, 0.88];
+        const vTitleRgb = mgV.isKeyDiscrepancy ? [0.68, 0.32, 0.0] : [0.26, 0.20, 0.65];
+        this.drawRect(this.margin + padX, cy + 8, innerW, mgBoxH, vFill, vStroke, 0.7);
+        let vy = cy - 4;
+        for (const ml of mgAnsLines) {
+          this.drawTextLine(ml, this.margin + padX + 6, vy, { font: 'F2', size: 9.0, rgb: vTitleRgb });
+          vy -= 12;
+        }
+        if (mgCruxLines.length) {
+          vy -= 2;
+          for (const cl of mgCruxLines) {
+            this.drawTextLine(cl, this.margin + padX + 6, vy, { font: 'F1', size: 8.5, rgb: [0.22, 0.24, 0.36] });
+            vy -= 11.5;
           }
         }
         this.y = topY - cardH - 10;
@@ -39866,7 +40987,7 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
       return btoa(bin);
     }
 
-    function openPdfPreviewModal({ title, filename, pdfBytes, previewHtml, plainText }) {
+    function openPdfPreviewModal({ title, filename, pdfBytes, previewHtml, plainText, wrongItems = null, wrongPdfParams = null }) {
       const { blob, url } = triggerPdfDownload(pdfBytes, filename);
       const area = document.getElementById('printReportArea');
       if (area) area.innerHTML = previewHtml;
@@ -39885,6 +41006,14 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
               <i data-lucide="download" class="w-3.5 h-3.5"></i>
               <span>Download .PDF File</span>
             </a>
+            ${Array.isArray(wrongItems) && wrongItems.length ? (() => {
+              const pendingCnt = wrongItems.filter(it => !MgVerdictStore.get(it.key || it.id || it.questionId)).length;
+              return pendingCnt > 0 ? `
+                <button type="button" id="btnModalVerifyMgAi" class="px-3.5 py-2 rounded-xl bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs">
+                  <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+                  <span>Add MAHA GYANI AI Verdicts (${pendingCnt})</span>
+                </button>` : `<span class="px-2.5 py-1.5 rounded-xl bg-violet-50 border border-violet-200 text-violet-800 text-[11px] font-bold">✓ All Verified by MAHA GYANI AI</span>`;
+            })() : ''}
             ${canShareFile ? `
               <button type="button" id="btnModalSharePdf" class="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs">
                 <i data-lucide="share-2" class="w-3.5 h-3.5"></i>
@@ -39914,6 +41043,29 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
       openModal(title, bodyHtml, () => {
         document.getElementById('btnModalDownloadPdf')?.addEventListener('click', () => {
           if (typeof showToast === 'function') showToast(`Downloading ${filename}...`, 'success');
+        });
+        document.getElementById('btnModalVerifyMgAi')?.addEventListener('click', async (e) => {
+          const btn = e.currentTarget;
+          if (!hasLiveAiConfigured()) {
+            if (typeof showToast === 'function') showToast('Connect your free Gemini/Groq API key in MAHA GYANI Settings first.', 'info');
+            closeModal();
+            openMahaGyani(false);
+            const sb = document.getElementById('mgSettingsBox');
+            if (sb) { mgState.settingsOpen = true; sb.classList.remove('hidden'); }
+            return;
+          }
+          btn.disabled = true;
+          const origHtml = btn.innerHTML;
+          const res = await verifyWrongItemsWithMahaGyani(wrongItems, (done, tot) => {
+            btn.innerHTML = `<span>Verifying with MAHA GYANI (${done}/${tot})...</span>`;
+          });
+          if (res.ok) {
+            if (typeof showToast === 'function') showToast(`MAHA GYANI verified ${res.verified} question(s)! Updating PDF...`, 'success');
+            generateWrongQuestionsPdf(wrongPdfParams || { scope: 'all' });
+          } else {
+            btn.disabled = false;
+            btn.innerHTML = origHtml;
+          }
         });
         document.getElementById('btnModalSharePdf')?.addEventListener('click', async () => {
           try {
@@ -40060,9 +41212,24 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
 
           const correctLetter = letters[item.correctIndex] || '?';
           const wrongLetter = (item.wrongIndex !== null && item.wrongIndex !== undefined) ? (letters[item.wrongIndex] || '?') : '—';
-          const explHtml = item.explanation
-            ? `<div style="margin-top:6px;padding:5px 8px;background:#eef2ff;border-left:3px solid #4f46e5;border-radius:4px;font-size:11px;color:#312e81;"><strong>Note:</strong> ${escapeHtml(item.explanation)}</div>`
-            : '';
+          const mgV = getMgVerdictDisplay(item);
+          const vBg = mgV.isKeyDiscrepancy ? '#fffbeb' : '#f5f3ff';
+          const vBorder = mgV.isKeyDiscrepancy ? '#d97706' : '#6d28d9';
+          const vColor = mgV.isKeyDiscrepancy ? '#92400e' : '#3b0764';
+          const vBadge = mgV.isAiVerified
+            ? (mgV.isKeyDiscrepancy
+                ? '<span style="background:#fde68a;color:#92400e;font-size:9.5px;font-weight:800;padding:1px 6px;border-radius:999px;">AI VERIFIED • KEY DISCREPANCY</span>'
+                : '<span style="background:#ddd6fe;color:#4c1d95;font-size:9.5px;font-weight:800;padding:1px 6px;border-radius:999px;">AI VERIFIED</span>')
+            : '<span style="background:#e2e8f0;color:#475569;font-size:9.5px;font-weight:700;padding:1px 6px;border-radius:999px;">VERIFIED BANK KEY</span>';
+          const explHtml = `
+            <div style="margin-top:7px;padding:7px 9px;background:${vBg};border:1px solid ${vBorder}40;border-left:3.5px solid ${vBorder};border-radius:6px;font-size:11px;color:${vColor};line-height:1.45;">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:3px;flex-wrap:wrap;">
+                <strong style="font-size:10.5px;letter-spacing:0.03em;text-transform:uppercase;">MAHA GYANI Final Verdict</strong>
+                ${vBadge}
+              </div>
+              <div style="font-weight:700;">${escapeHtml(mgV.finalAnswer)}</div>
+              ${mgV.crux ? `<div style="margin-top:3px;color:#334155;"><strong>Crux:</strong> ${escapeHtml(mgV.crux)}</div>` : ''}
+            </div>`;
 
           return `
             <div style="border:1px solid #cbd5e1;border-radius:10px;padding:10px 12px;margin-bottom:10px;background:#ffffff;break-inside:avoid;page-break-inside:avoid;">
@@ -40131,7 +41298,9 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
           const wLet = (item.wrongIndex !== null && item.wrongIndex !== undefined) ? (letters[item.wrongIndex] || '?') : '-';
           textLines.push(`Q${pdfQNum}. ${item.question}`);
           (item.options || []).forEach((o, i) => textLines.push(`  (${letters[i] || i + 1}) ${o}`));
+          const mgVText = getMgVerdictDisplay(item);
           textLines.push(`  Your Choice: ${wLet} | Correct: ${cLet}`);
+          textLines.push(`  MAHA GYANI Verdict (${mgVText.isAiVerified ? 'AI Verified' : 'Bank Key'}): ${mgVText.finalAnswer}${mgVText.crux ? ' — ' + mgVText.crux : ''}`);
           textLines.push('');
         }
       }
@@ -40141,7 +41310,9 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
         filename,
         pdfBytes,
         previewHtml: area.innerHTML,
-        plainText: textLines.join('\n')
+        plainText: textLines.join('\n'),
+        wrongItems: items,
+        wrongPdfParams: { scope, subjectId }
       });
 
       return { ok: true, count: items.length, subjects: [...groups.keys()], pdfBytes };
@@ -40502,11 +41673,187 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
             <button data-subtab="summary" class="py-2.5 text-sm whitespace-nowrap ${state.analyticsSubTab === 'summary' ? 'subtab-active' : 'subtab-inactive'}">Session Summary &amp; Review</button>
             <button data-subtab="deeper" class="py-2.5 text-sm whitespace-nowrap ${state.analyticsSubTab === 'deeper' ? 'subtab-active' : 'subtab-inactive'}">Deeper Analysis</button>
             <button data-subtab="progress" class="py-2.5 text-sm whitespace-nowrap ${state.analyticsSubTab === 'progress' ? 'subtab-active' : 'subtab-inactive'}">Multi-Session Progress (${subjSessions.length})</button>
+            <button data-subtab="central_db" class="py-2.5 text-sm whitespace-nowrap ${state.analyticsSubTab === 'central_db' ? 'subtab-active' : 'subtab-inactive'}">Attempt DB Insights</button>
           </div>
 
           ${state.analyticsSubTab === 'summary' ? renderSessionSummaryTab(activeSession) : ''}
           ${state.analyticsSubTab === 'deeper' ? renderDeeperAnalysisTab(activeSession, subjSessions) : ''}
           ${state.analyticsSubTab === 'progress' ? renderProgressTab(subjSessions) : ''}
+          ${state.analyticsSubTab === 'central_db' ? renderCentralAnalyticsTab() : ''}
+        </div>
+      `;
+    }
+
+    function renderCentralAnalyticsTab() {
+      const attempts = AttemptDB.getAttemptsForStudent();
+      const consolidated = AttemptDB.getConsolidatedQuestions();
+      const mistakes = consolidated.filter(q => q.everWrong);
+
+      if (!attempts.length) {
+        return `
+          <div class="bg-white rounded-2xl border border-slate-200 p-8 text-center text-sm text-slate-500">
+            No attempt records stored yet. Complete any practice question to populate real Attempt DB analytics.
+          </div>`;
+      }
+
+      const totalAtt = attempts.length;
+      const totalCor = attempts.filter(a => a.isCorrect).length;
+      const totalWr = totalAtt - totalCor;
+      const overallAcc = ((totalCor / totalAtt) * 100).toFixed(1);
+
+      const resolvedCount = mistakes.filter(m => m.isMastered).length;
+      const correctedCount = mistakes.filter(m => m.isCorrected).length;
+      const unresolvedCount = mistakes.filter(m => !m.isMastered).length;
+      const statusCounts = {
+        'Not Revised': consolidated.filter(q => q.learningStatus === 'Not Revised').length,
+        'Under Revision': consolidated.filter(q => q.learningStatus === 'Under Revision').length,
+        'Corrected Once': consolidated.filter(q => q.learningStatus === 'Corrected Once').length,
+        'Consistently Correct': consolidated.filter(q => q.learningStatus === 'Consistently Correct').length
+      };
+
+      // Improvement after revision: for questions missed at least once & attempted again after first mistake
+      let revTotalAfterMistake = 0;
+      let revCorrectAfterMistake = 0;
+      let improvedQuestions = 0;
+      mistakes.forEach(m => {
+        const firstWrongIdx = m.attempts.findIndex(a => !a.isCorrect);
+        if (firstWrongIdx !== -1 && firstWrongIdx < m.attempts.length - 1) {
+          const followUps = m.attempts.slice(firstWrongIdx + 1);
+          revTotalAfterMistake += followUps.length;
+          const fCor = followUps.filter(a => a.isCorrect).length;
+          revCorrectAfterMistake += fCor;
+          if (fCor > 0) improvedQuestions++;
+        }
+      });
+      const revAccAfterMistake = revTotalAfterMistake > 0 ? ((revCorrectAfterMistake / revTotalAfterMistake) * 100).toFixed(1) + '%' : '—';
+
+      // Daily Accuracy & Mistakes Over Time (last 14 active dates)
+      const dayMap = new Map();
+      [...attempts].reverse().forEach(a => {
+        const day = a.timestamp.slice(0, 10);
+        if (!dayMap.has(day)) dayMap.set(day, { day, total: 0, correct: 0, wrong: 0 });
+        const d = dayMap.get(day);
+        d.total++; if (a.isCorrect) d.correct++; else d.wrong++;
+      });
+      const dailyTrend = [...dayMap.values()].slice(-14).map(d => ({
+        ...d,
+        acc: d.total ? Math.round((d.correct / d.total) * 100) : 0
+      }));
+
+      // Subject-wise & Chapter-wise accuracy
+      const subjMap = new Map();
+      const chapMap = new Map();
+      attempts.forEach(a => {
+        if (!subjMap.has(a.subjectId)) subjMap.set(a.subjectId, { name: a.subjectName, total: 0, correct: 0, wrong: 0 });
+        const s = subjMap.get(a.subjectId);
+        s.total++; if (a.isCorrect) s.correct++; else s.wrong++;
+
+        const ck = `${a.subjectId}::${a.chapter}`;
+        if (!chapMap.has(ck)) chapMap.set(ck, { subjectName: a.subjectName, chapter: a.chapter, total: 0, correct: 0, wrong: 0 });
+        const c = chapMap.get(ck);
+        c.total++; if (a.isCorrect) c.correct++; else c.wrong++;
+      });
+      const subjRows = [...subjMap.values()].map(s => ({ ...s, acc: ((s.correct / s.total) * 100).toFixed(1) }));
+      const chapRows = [...chapMap.values()].map(c => ({ ...c, acc: Number(((c.correct / c.total) * 100).toFixed(1)) })).sort((a, b) => a.acc - b.acc).slice(0, 8);
+
+      // Most frequently incorrect & attention-needed questions
+      const topMissed = [...mistakes].sort((a, b) => b.totalWrong - a.totalWrong || a.accuracyPct - b.accuracyPct).slice(0, 8);
+
+      return `
+        <div class="space-y-5">
+          <!-- KPI Row -->
+          <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div class="bg-white rounded-2xl border border-slate-200 p-4">
+              <div class="text-xs text-slate-500 font-medium">All-Time Accuracy</div>
+              <div class="text-2xl font-extrabold text-indigo-600 mt-1">${overallAcc}%</div>
+              <div class="text-[11px] text-slate-500">${totalCor}✓ / ${totalWr}✗ (${totalAtt} attempts)</div>
+            </div>
+            <div class="bg-white rounded-2xl border border-slate-200 p-4">
+              <div class="text-xs text-slate-500 font-medium">Corrected vs Unresolved</div>
+              <div class="text-2xl font-extrabold text-emerald-600 mt-1">${correctedCount} <span class="text-base text-rose-600">/ ${unresolvedCount}</span></div>
+              <div class="text-[11px] text-slate-500">${resolvedCount} mastered (${AttemptDB.getMasteryThreshold()}× streak)</div>
+            </div>
+            <div class="bg-white rounded-2xl border border-slate-200 p-4">
+              <div class="text-xs text-slate-500 font-medium">Improvement After Revision</div>
+              <div class="text-2xl font-extrabold text-violet-600 mt-1">${revAccAfterMistake}</div>
+              <div class="text-[11px] text-slate-500">${improvedQuestions} mistake Qs improved (${revTotalAfterMistake} rev tries)</div>
+            </div>
+            <div class="bg-white rounded-2xl border border-slate-200 p-4">
+              <div class="text-xs text-slate-500 font-medium">Learning Status Mix</div>
+              <div class="text-xs mt-1.5 space-y-0.5 text-slate-700 font-semibold">
+                <div>Not Revised: <span class="text-rose-600">${statusCounts['Not Revised']}</span> • Under Rev: <span class="text-amber-600">${statusCounts['Under Revision']}</span></div>
+                <div>Corrected 1×: <span class="text-sky-600">${statusCounts['Corrected Once']}</span> • Mastered: <span class="text-emerald-600">${statusCounts['Consistently Correct']}</span></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Accuracy Trends & Mistakes Over Time -->
+          <div class="bg-white rounded-2xl border border-slate-200 p-4">
+            <h3 class="text-sm font-bold text-slate-900 mb-3">Accuracy Trend &amp; Mistakes Over Time (Active Days)</h3>
+            <div class="space-y-2">
+              ${dailyTrend.map(d => `
+                <div class="flex items-center gap-3 text-xs">
+                  <div class="w-24 font-mono text-slate-600 shrink-0">${d.day}</div>
+                  <div class="flex-1 h-3 bg-slate-100 rounded-full overflow-hidden">
+                    <div class="h-full ${d.acc >= 75 ? 'bg-emerald-500' : d.acc >= 50 ? 'bg-amber-500' : 'bg-rose-500'}" style="width:${d.acc}%"></div>
+                  </div>
+                  <div class="w-36 text-right font-semibold text-slate-700 shrink-0">${d.acc}% (${d.wrong} wrong / ${d.total})</div>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+
+          <!-- Subject-wise & Chapter-wise Accuracy -->
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div class="bg-white rounded-2xl border border-slate-200 p-4">
+              <h3 class="text-sm font-bold text-slate-900 mb-3">Subject-Wise Accuracy (All Attempts)</h3>
+              <div class="space-y-2.5">
+                ${subjRows.map(s => `
+                  <div>
+                    <div class="flex justify-between text-xs font-semibold mb-1">
+                      <span>${escapeHtml(s.name)}</span>
+                      <span>${s.acc}% (${s.correct}/${s.total})</span>
+                    </div>
+                    <div class="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                      <div class="h-full bg-indigo-500" style="width:${s.acc}%"></div>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+            <div class="bg-white rounded-2xl border border-slate-200 p-4">
+              <h3 class="text-sm font-bold text-slate-900 mb-3">Lowest-Accuracy Chapters (Needs Attention)</h3>
+              <div class="space-y-2">
+                ${chapRows.map(c => `
+                  <div class="flex items-center justify-between text-xs p-2 rounded-xl bg-slate-50 border border-slate-200">
+                    <div class="min-w-0">
+                      <div class="font-bold text-slate-800 truncate">${escapeHtml(c.chapter)}</div>
+                      <div class="text-[11px] text-slate-500">${escapeHtml(c.subjectName)}</div>
+                    </div>
+                    <div class="text-right font-extrabold ${c.acc < 50 ? 'text-rose-600' : 'text-amber-600'} shrink-0">${c.acc}% (${c.wrong}✗)</div>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          </div>
+
+          <!-- Most Frequently Incorrect Questions -->
+          <div class="bg-white rounded-2xl border border-slate-200 p-4">
+            <h3 class="text-sm font-bold text-slate-900 mb-3">Most Frequently Incorrect Questions</h3>
+            ${topMissed.length ? `
+              <div class="space-y-2">
+                ${topMissed.map(m => `
+                  <div class="p-3 rounded-xl border border-rose-200 bg-rose-50/40 flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <div class="min-w-0 flex-1">
+                      <div class="font-bold text-slate-900">${escapeHtml(m.question)}</div>
+                      <div class="text-[11px] text-slate-600 mt-0.5">${escapeHtml(m.subjectName)} • ${escapeHtml(m.chapter)} • Missed <strong>${m.totalWrong}×</strong> • Accuracy: <strong>${m.accuracyPct}%</strong> • Status: <strong>${escapeHtml(m.learningStatus)}</strong></div>
+                    </div>
+                    <button type="button" data-view-q-history="${escapeHtml(m.questionId)}" class="px-2.5 py-1.5 rounded-lg bg-white border border-rose-200 hover:bg-rose-100 text-rose-700 font-bold shrink-0">View History</button>
+                  </div>
+                `).join('')}
+              </div>
+            ` : '<p class="text-xs text-slate-500">No mistakes recorded yet.</p>'}
+          </div>
         </div>
       `;
     }
@@ -40934,6 +42281,9 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
     }
 
     function bindAnalyticsEvents() {
+      document.querySelectorAll('[data-view-q-history]').forEach(btn => {
+        btn.addEventListener('click', () => openQuestionHistoryModal(btn.dataset.viewQHistory));
+      });
       document.getElementById('btnAnalyticsPdfReport')?.addEventListener('click', downloadPerformancePdfReport);
       document.getElementById('btnEmptyStartQuiz')?.addEventListener('click', () => startPracticeSession('ALL'));
       document.getElementById('btnLoadDemoSessions')?.addEventListener('click', loadDemoSessionsForActiveSubject);
@@ -42595,7 +43945,16 @@ create policy "Admin-only write MCQs" on questions for all
       { subj: "cost-acc", cat: "Overheads", name: "Primary Overhead Distribution \u2014 Standard Apportionment Bases", formula: "Dep/Insurance \u2192 Asset Value | Rent \u2192 Area | Lighting \u2192 Light Points/Area | Power \u2192 HP \u00d7 Machine Hrs | Maintenance \u2192 Machine Hrs | Supervision/Welfare \u2192 Employees", note: "Indirect Material \u2192 Direct Material; Indirect Labour \u2192 Direct Wages; Sundries \u2192 Labour hrs / Machine hrs / Direct wages." },
       { subj: "cost-acc", cat: "Overheads", name: "Departmental vs. Blanket Overhead Recovery Rate", formula: "Blanket Rate = (Total Factory Overheads / Total Factory Base) \u00d7 100 | Departmental Rate = (Dept Overheads / Dept Base) \u00d7 100", note: "Blanket rate uses a single rate for the whole factory; departmental rate computes a separate rate for each production department." },
       { subj: "cost-acc", cat: "Process Costing", name: "Process Stock Account \u2014 Weighted Average Transfer Cost", formula: "Transfer Cost per Unit = Total Debit Amount of Process Stock A/c \u00f7 Total Debit Units of Process Stock A/c", note: "Debit side includes Opening Process Stock (bal. b/d) + Current Output received from Process A/c." },
-      { subj: "cost-acc", cat: "Cost Accounting Systems", name: "Non-Integral Control Accounts \u2014 Core Journal Entries", formula: "Direct Issue: WIP Dr To SLC | Indirect Issue / Normal Loss: Prod OH Dr To SLC | Abn. Loss: Costing P&L Dr To SLC | Under-Recovery: Costing P&L Dr To OH Control", note: "Purchase: Material Control Dr To GLC; Sales: GLC Dr To Costing P&L; Transfer to FG: FG Control Dr To WIP Control & Admin OH Control." }
+      { subj: "cost-acc", cat: "Cost Accounting Systems", name: "Non-Integral Control Accounts \u2014 Core Journal Entries", formula: "Direct Issue: WIP Dr To SLC | Indirect Issue / Normal Loss: Prod OH Dr To SLC | Abn. Loss: Costing P&L Dr To SLC | Under-Recovery: Costing P&L Dr To OH Control", note: "Purchase: Material Control Dr To GLC; Sales: GLC Dr To Costing P&L; Transfer to FG: FG Control Dr To WIP Control & Admin OH Control." },
+      { subj: "idt", cat: "Customs", name: "Customs Taxable Event (Import vs. Export)", formula: "Import: Starts at TWI (12 NM) \u2192 Continues in Customs custody \u2192 Completes when goods join mass of goods in India | Export: Starts on presentation \u2192 Completes on crossing TWI (12 NM)", note: "Customs Act, 1962 extends to whole of India. Law consists of Customs Act, Customs Tariff Act, Rules & Regulations." },
+      { subj: "idt", cat: "Customs", name: "Scope of 'India' under Customs (Airspace, Subsoil, EEZ & DTA/SEZ)", formula: "India = Land + Airspace above + Subsoil underground + TWI (12 NM) | EEZ (up to 200 NM) = India ONLY for oil extraction from oil rigs | Indian Customs Waters = up to 200 NM", note: "1 Nautical Mile (NM) = 1.852 km. Beyond 200 NM = High Seas. Within India, area outside SEZ (Special Economic Zone) / EOU (Export Oriented Unit) is DTA (Domestic Tariff Area)." },
+      { subj: "idt", cat: "Customs", name: "Special Goods: Imported, Domestic, Coastal, Transit & Maritime Wreckage", formula: "Imported = Duty unpaid \u2192 Paid = Domestic | Coastal = Indian port to Indian port (non-imported) | Transit = Passes via Indian port without unloading | Jetsam / Flotsam / Derelict / Wreckage = Treated as Imported Goods", note: "Jetsam (thrown overboard in bad weather), Flotsam (afloat after ship sinks), Derelict (vessel left unattended at sea), Wreckage (broken parts from accident) \u2014 all liable to Customs duty unless waived by Proper Officer." },
+      { subj: "idt", cat: "Customs", name: "Re-Importation of Goods Exported for Repairs", formula: "Customs Duty Payable on = Cost of Repairs + Insurance + Freight (Both Ways)", note: "Mandatory condition: Ownership of goods must remain unchanged. General re-import (Import \u2192 Export \u2192 Re-import) attracts the same provisions as similar imported goods." },
+      { subj: "idt", cat: "Customs", name: "Duty Reliefs (Pilferage, Remission, Relinquishment) & Abatement Formula", formula: "Abatement = (Duty \u00f7 Total Value of Goods) \u00d7 Value of Damaged Goods | Net Duty = Duty \u2212 Abatement", note: "Pilferage (Sec 13, 'Chori'): No duty if pilfered & not restored; importer need NOT prove pilferage (refund if paid). Remission (Sec 23): Lost/destroyed before Home Consumption clearance (importer MUST prove). Relinquishment of title before HC clearance order \u2192 No duty. Example: Duty \u20b910,000, Total \u20b91,00,000, Damaged \u20b940,000 \u2192 Abatement \u20b94,000 \u2192 Pay \u20b96,000." },
+      { subj: "idt", cat: "Customs", name: "SWS Exclusions, AIDC, BCD Schedules & GST Compensation Cess", formula: "SWS = 10% of BCD (3% for Gold & Silver incl. platinum-plated silver) | IGST = Add all duties EXCEPT GST CC | GST CC = Add all duties EXCLUDING IGST", note: "Duties EXCLUDED when computing SWS: Safeguard Duty, CVD on Subsidized Articles, Anti-Dumping Duty, IGST/GST CC, and AIDC (Agriculture Infrastructure & Development Cess on apples, kabuli chana, urea, coal, gold & silver). BCD First Schedule = Import duties; Second Schedule = Export duties (Specific = quantity-based; Ad Valorem = % of AV)." },
+      { subj: "idt", cat: "Customs", name: "Safeguard Duty (3%/9% Exemption), CVD & Anti-Dumping Duty", formula: "Anti-Dumping Duty (ADD) \u2264 Margin of Dumping = Normal Value \u2212 Export Value", note: "Safeguard Duty (SGD): Valid 4 yrs (extendable up to 10 yrs); NOT levied on developing country if single-country share \u2264 3% OR aggregate developing-country share \u2264 9% of total imports. CVD (subsidized articles: Govt grant/loan/equity or price support) & ADD: Valid 5 yrs + extendable 5 yrs." },
+      { subj: "idt", cat: "Customs", name: "Customs Valuation Format (Ex-Factory \u2192 FOB \u2192 Rule 10(1) & 10(2) \u2192 CIF)", formula: "Ex-Factory + Carriage/Handling/Loading to ship = FOB \u2192 + Rule 10(1) Additions = Customs FOB \u2192 + Rule 10(2) Freight & Insurance = Assessable Value (CIF)", note: "Rule 10(1) Additions: Selling commission, non-durable/non-returnable packaging, engineering/design/plan/sketch done OUTSIDE India (NOT if done in India), royalty/license, free material from buyer, expenses paid on supplier's behalf, inspection charges recovered from importer. Rule 10(2): Air freight = Lower(Actual, 20% FOB); Vessel freight = Actual (20% FOB if unknown); Insurance = Actual (1.125% FOB if unknown)." },
+      { subj: "idt", cat: "Customs", name: "Customs Valuation Traps: Demurrage, Lighterage & Commission", formula: "ADD: Lighterage/Barge charges + Ship Demurrage (vessel wait penalty) + Selling Commission | DO NOT ADD: Buying Commission + Indian Port Late-Delivery Demurrage + Indian Port Unloading/Local Freight", note: "Lighterage/barge charges (transfer via small boats in shallow water) and ship-company waiting demurrage are included in AV. Penalty charged by Indian port for late delivery by importer, unloading at Indian port, and transport to Indian factory are NEVER added. Buying commission paid by importer to own agent (anywhere) is NEVER added." }
     ];
 
     const SMART_REVISION_ASSUMPTIONS = [
@@ -46637,6 +47996,10 @@ Your real **.PDF file** download has started and the preview modal is open—tap
         let reply;
         if (hasLiveAiConfigured()) {
           reply = await callLiveAiEngine(clean, ctx);
+          if (ctx && ctx.mcq && ctx.mcq.id && reply) {
+            const parsedVerdict = MgVerdictStore.parseFromReply(reply);
+            if (parsedVerdict.finalAnswer) MgVerdictStore.set(ctx.mcq.id, parsedVerdict);
+          }
         } else {
           await new Promise(r => setTimeout(r, 260));
           reply = buildOfflineTutorReply(clean, ctx, actionType);
@@ -46948,6 +48311,14 @@ Your real **.PDF file** download has started and the preview modal is open—tap
 
     loadState();
     if (!state.userProfile) state.userProfile = {};
+    AttemptDB.initSync();
+    AttemptDB.initAsync();
+    document.getElementById('btnDismissStorageWarn')?.addEventListener('click', () => {
+      document.getElementById('storageWarningBanner')?.classList.add('hidden');
+    });
+    document.getElementById('btnBannerBackupNow')?.addEventListener('click', () => {
+      if (typeof downloadAttemptBackupJson === 'function') downloadAttemptBackupJson(false);
+    });
     if (!state.userProfile.supabaseUrl) state.userProfile.supabaseUrl = 'https://yhpfqoliaanibmadljti.supabase.co';
     if (!state.userProfile.supabaseAnonKey) state.userProfile.supabaseAnonKey = 'sb_publishable_CmAOVMaOaYZCJdeatZU_1A_1rhIfcOC';
     applyTheme();
