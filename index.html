@@ -37113,26 +37113,42 @@
         }
         if (!raw) return;
         const parsed = JSON.parse(raw);
-        if (parsed && Array.isArray(parsed.subjects) && parsed.subjects.length > 0) {
-          const loaded = parsed.subjects.map(s => {
-            if (s.id === 'idt' && s.name === 'Indirect Tax (IDT)') {
-              return {
-                ...s,
-                name: 'Direct and Indirect Taxation',
-                code: 'TAX',
-                description: 'Direct Tax (Income Tax, TDS/TCS) & Indirect Tax (GST — Supply, RCM, ITC, Valuation & Customs).'
-              };
-            }
-            return s;
-          });
-          // Ensure all 4 core subjects exist even if older localStorage was present
-          DEFAULT_SUBJECTS.forEach(defSubj => {
-            if (!loaded.some(s => s.id === defSubj.id)) {
-              loaded.push(JSON.parse(JSON.stringify(defSubj)));
-            }
-          });
-          if (!migratedFromOld) { state.subjects = loaded; }
-          state.activeSubjectId = parsed.activeSubjectId || loaded[0].id;
+        if (parsed && typeof parsed === 'object') {
+          // Always start from fresh built-in DEFAULT_SUBJECTS so app updates take effect cleanly
+          const freshSubjects = JSON.parse(JSON.stringify(DEFAULT_SUBJECTS));
+          const defaultIdMap = new Map(freshSubjects.map(ds => [ds.id, new Set((ds.questions || []).map(q => q.id))]));
+
+          // Merge any user-added custom subjects or custom questions from slim format
+          if (Array.isArray(parsed.customSubjects)) {
+            parsed.customSubjects.forEach(cs => {
+              if (cs && cs.id && !defaultIdMap.has(cs.id)) freshSubjects.push(cs);
+            });
+          }
+          if (parsed.customQuestionsBySubject && typeof parsed.customQuestionsBySubject === 'object') {
+            Object.entries(parsed.customQuestionsBySubject).forEach(([sid, qs]) => {
+              const target = freshSubjects.find(x => x.id === sid);
+              if (!target || !Array.isArray(qs)) return;
+              const existingIds = new Set((target.questions || []).map(q => q.id));
+              qs.forEach(q => { if (q && q.id && !existingIds.has(q.id)) target.questions.push(q); });
+            });
+          }
+          // Backward-compatibility: preserve any user-added questions from legacy parsed.subjects
+          if (Array.isArray(parsed.subjects)) {
+            parsed.subjects.forEach(ls => {
+              if (!ls || !ls.id) return;
+              if (!defaultIdMap.has(ls.id)) {
+                if (!freshSubjects.some(x => x.id === ls.id)) freshSubjects.push(ls);
+              } else {
+                const target = freshSubjects.find(x => x.id === ls.id);
+                const existingIds = new Set((target.questions || []).map(q => q.id));
+                (ls.questions || []).forEach(q => {
+                  if (q && q.id && !existingIds.has(q.id)) target.questions.push(q);
+                });
+              }
+            });
+          }
+          state.subjects = freshSubjects;
+          state.activeSubjectId = parsed.activeSubjectId || freshSubjects[0].id;
           state.addMcqSubjectId = state.activeSubjectId;
           state.sessions = Array.isArray(parsed.sessions) ? parsed.sessions : [];
           if (parsed.userProfile) {
@@ -37161,27 +37177,71 @@
       }
     }
 
+    function cleanupLegacyPlatformKeys() {
+      const legacyKeys = [
+        'mcq_conqueror_platform_v16', 'mcq_conqueror_platform_v15', 'mcq_conqueror_platform_v14',
+        'mcq_conqueror_platform_v13', 'mcq_conqueror_platform_v12', 'mcq_conqueror_platform_v11',
+        'mcq_conqueror_platform_v10', 'mcq_conqueror_platform_v9', 'mcq_conqueror_platform_v8',
+        'mcq_conqueror_platform_v7', 'mcq_conqueror_platform_v6'
+      ];
+      legacyKeys.forEach(k => { try { localStorage.removeItem(k); } catch (_) {} });
+    }
+
+    function buildSlimStatePayload(trimSessionItems = false) {
+      const defaultSubjMap = new Map((DEFAULT_SUBJECTS || []).map(ds => [ds.id, new Set((ds.questions || []).map(q => q.id))]));
+      const customSubjects = [];
+      const customQuestionsBySubject = {};
+      (state.subjects || []).forEach(subj => {
+        if (!defaultSubjMap.has(subj.id)) {
+          customSubjects.push(subj);
+        } else {
+          const defIds = defaultSubjMap.get(subj.id);
+          const extra = (subj.questions || []).filter(q => q && q.id && !defIds.has(q.id));
+          if (extra.length) customQuestionsBySubject[subj.id] = extra;
+        }
+      });
+      const sessionsToSave = trimSessionItems
+        ? (state.sessions || []).map((sess, idx) => idx < 25 ? sess : { ...sess, items: [] })
+        : (state.sessions || []);
+
+      return {
+        customSubjects,
+        customQuestionsBySubject,
+        activeSubjectId: state.activeSubjectId,
+        sessions: sessionsToSave,
+        userProfile: state.userProfile,
+        adminPasscodeHash: state.adminPasscodeHash,
+        bookmarks: state.bookmarks,
+        qotdAnswered: state.qotdAnswered,
+        srsSchedule: state.srsSchedule,
+        bookmarkCollections: state.bookmarkCollections,
+        customFlashcards: state.customFlashcards,
+        speedRecords: state.speedRecords,
+        revisedAssumptions: state.revisedAssumptions,
+        theme: state.theme,
+        instantFeedback: state.instantFeedback,
+        dailyGoal: state.dailyGoal,
+        studyDays: state.studyDays,
+        recentlyViewed: state.recentlyViewed,
+        todos: state.todos,
+        planner: state.planner,
+        notes: state.notes
+      };
+    }
+
     function saveState() {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({
-          subjects: state.subjects,
-          activeSubjectId: state.activeSubjectId,
-          sessions: state.sessions,
-          userProfile: state.userProfile,
-          adminPasscodeHash: state.adminPasscodeHash,
-          bookmarks: state.bookmarks,
-          theme: state.theme,
-          instantFeedback: state.instantFeedback,
-          dailyGoal: state.dailyGoal,
-          studyDays: state.studyDays,
-          recentlyViewed: state.recentlyViewed,
-          todos: state.todos,
-          planner: state.planner,
-          notes: state.notes
-        }));
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(buildSlimStatePayload(false)));
+        cleanupLegacyPlatformKeys();
       } catch (e) {
-        if (typeof AttemptDB !== 'undefined') {
-          AttemptDB.handleStorageFailure('Could not save app state to localStorage.', e);
+        // Free superseded legacy v6..v16 keys & retry with slimmed session summaries (full attempts remain safely in IndexedDB AttemptDB)
+        cleanupLegacyPlatformKeys();
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(buildSlimStatePayload(true)));
+        } catch (e2) {
+          if (typeof AttemptDB !== 'undefined') {
+            AttemptDB.handleStorageFailure('Could not save app state to localStorage.', e2);
+          }
         }
       }
     }
